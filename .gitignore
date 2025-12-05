@@ -13,7 +13,7 @@ _build/
 *.csv
 core.*
 tmp/
-
+*env*/
 # wavlm
 WavLM-Base+.pt
 

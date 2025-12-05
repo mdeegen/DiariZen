@@ -4,6 +4,8 @@
 
 import os
  
+import random
+
 import torch
 import numpy as np
 
@@ -67,7 +69,7 @@ def _collate_fn(batch, max_speakers_per_chunk=4) -> torch.Tensor:
     collated_x = []
     collated_y = []
     collated_names = []
-    
+
     for x, y, name in batch:
         num_speakers = y.shape[-1]
         if num_speakers > max_speakers_per_chunk:
@@ -87,6 +89,7 @@ def _collate_fn(batch, max_speakers_per_chunk=4) -> torch.Tensor:
         else:
             # we have exactly the right number of speakers
             pass
+        # print(f'name: {name} | x: {x.shape} | y: {y.shape}')
         collated_x.append(x)
         collated_y.append(y)
         collated_names.append(name)
@@ -109,11 +112,15 @@ class DiarizationDataset(Dataset):
         model_rf_step: float,  # model.receptive_field.step, seconds
         chunk_size: int = 5,  # seconds
         chunk_shift: int = 5, # seconds
-        sample_rate: int = 16000
+        sample_rate: int = 16000,
+        channel_mode: str = "multichannel",    # sdm, random, average, multichannel
     ): 
         self.chunk_indices = []
         
         self.sample_rate = sample_rate
+        self.chunk_sample_size = sample_rate * chunk_size
+
+        self.channel_mode = channel_mode      
         
         self.model_rf_step = model_rf_step
         self.model_rf_duration = model_rf_duration
@@ -193,24 +200,47 @@ class DiarizationDataset(Dataset):
         
         return np.array(annotations, dtype=segment_dtype)
 
-    def extract_wavforms(self, path, start, end, num_channels=8):
+    def extract_wavforms(self, path, start, end, num_channels=4):
         start = int(start * self.sample_rate)
         end = int(end * self.sample_rate)
         data, sample_rate = sf.read(path, start=start, stop=end)
-        assert sample_rate == self.sample_rate
+        assert sample_rate == self.sample_rate, f"Sample rate mismatch: {sample_rate} != {self.sample_rate}"
+
         if data.ndim == 1:
             data = data.reshape(1, -1)
         else:
             data = np.einsum('tc->ct', data) 
-        return data[:num_channels, :]
+
+        if self.channel_mode == "sdm":
+            return np.expand_dims(data[0, :], 0)
+        elif self.channel_mode == "random":
+            channel_idx = random.randint(0, data.shape[0] - 1)
+            return np.expand_dims(data[channel_idx, :], 0)
+        elif self.channel_mode == "average":
+            return np.mean(data, 0, keepdims=True)
+        elif self.channel_mode == "multichannel":
+            current_channels = data.shape[0]
+            if current_channels < num_channels:
+                pad_width = ((0, num_channels - current_channels), (0, 0))  # (channel, time)
+                data = np.pad(data, pad_width, mode='constant')
+            else:
+                data = data[:num_channels, :]
+            return data
+        else:
+            raise ValueError(f"Unsupported channel_mode: {self.channel_mode}")
 
     def __len__(self):
         return len(self.chunk_indices)
     
     def __getitem__(self, idx):
-        session, path, chunk_start, chunk_end = self.chunk_indices[idx]
-        data = self.extract_wavforms(path, chunk_start, chunk_end)          # [start, end)
-        
+        while True:
+            session, path, chunk_start, chunk_end = self.chunk_indices[idx]
+            data = self.extract_wavforms(path, chunk_start, chunk_end)          # [start, end)
+            if data.shape[1] == self.chunk_sample_size:
+                break
+            if data.shape[1] < self.chunk_sample_size:   # mainly for CHiME6
+                idx = random.randint(0, len(self.chunk_indices) - 1)
+
         # chunked annotations
         session_idx = self.get_session_idx(session)
         annotations_session = self.annotations[self.annotations['session_idx'] == session_idx]
@@ -241,5 +271,5 @@ class DiarizationDataset(Dataset):
         ):
             mapped_label = mapping[label]
             mask_label[start : end + 1, mapped_label] = 1
-        
+
         return data, mask_label, session
