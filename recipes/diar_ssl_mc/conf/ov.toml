@@ -1,0 +1,43 @@
+
+[train_dataset]
+path = "dataset.DiarizationDataset"
+[train_dataset.args]
+load_gcc_dir = "base" # "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/standard_gcc/"  #  false  #
+subset = "train"  # "train"  # "dev"
+scp_file = "data_no_chime/train/wav.scp"
+rttm_file = "data_no_chime/train/rttm"
+uem_file = "data_no_chime/train/all.uem"
+chunk_size = 8
+chunk_shift = 6
+sample_rate = 16000
+channel_mode = "multichannel"
+resample = true
+
+
+[validate_dataset]
+path = "dataset.DiarizationDataset"
+[validate_dataset.args]
+load_gcc_dir = "base" # "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/standard_gcc/"
+subset = "dev"  # "train"  # "dev"
+scp_file = "data_no_chime/dev/wav.scp"
+rttm_file = "data_no_chime/dev/rttm"
+uem_file = "data_no_chime/dev/all.uem"
+chunk_size = 8
+chunk_shift = 8
+sample_rate = 16000
+channel_mode = "multichannel"
+resample = true
+
+[test_dataset]
+path = "dataset.DiarizationDataset"
+[test_dataset.args]
+load_gcc_dir = "base" # "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/standard_gcc/"
+subset = "test"  # "train"  # "dev"
+scp_file = "data_no_chime/test/wav.scp"
+rttm_file = "data_no_chime/test/rttm"
+uem_file = "data_no_chime/test/all.uem"
+chunk_size = 8
+chunk_shift = 0.8
+sample_rate = 16000
+channel_mode = "multichannel"
+resample = true
