@@ -16,7 +16,7 @@ conf_dir=$recipe_root/conf
 
 # training setup
 use_dual_opt=true  # true for wavlm_updated_conformer.toml; false for the others
-export train_conf=$conf_dir/spk_count_film.toml # gcc_encoder_precomputed  baseline_sc_debug.toml   #    mc_wavlm_updated_conformer.toml #MC
+export train_conf=$conf_dir/gcpsd_encoder.toml # gcc_encoder_precomputed  baseline_sc_debug.toml   #    mc_wavlm_updated_conformer.toml #MC
 # TODO:  GCC PFAD in pyannote: EVAL standard_gcc, muss auch für base angepasst werden
 # TODO:  GCC PFAD in pyannote: EVAL standard_gcc, muss auch für base angepasst werden
 # spk_count_linear_noisy_modelbased  spk_count_linear_ov spk_count_linear_noisy_to_gcpsd_9layer_frozen_median_lr spk_count_linear_noisy_to_gcpsd_ffn_frozen_median

@@ -82,3 +82,4 @@ def init_logging_logger(config):
     logger.addHandler(file_handler)
 
     logger.info(f"Initialized logger with log file in {log_dir.as_posix()}.")
+    return logger

@@ -22,7 +22,7 @@ validation_interval = 1
 freeze_wavlm = false
 lr_decay = false
 use_one_cycle_lr = false
-validation_before_training = true
+validation_before_training = true # true       # activate validation activate validation activate validation activate validation
 preheat_epochs = 0
 
 [optimizer_small]
@@ -38,6 +38,7 @@ lr = 1e-3
 [model]
 path = "diarizen.models.eend.model_wavlm_conformer_mc.Model" # "model_mc_channel_att.Model" # only change here to my model
 [model.args]
+num_layer_aux = 2
 wavlm_src = "wavlm_base_s80_md"
 wavlm_layer_num = 13
 wavlm_feat_dim = 768
@@ -56,6 +57,9 @@ multichannel_processing = true
 [train_dataset]
 path = "dataset.DiarizationDataset"
 [train_dataset.args]
+load_gcc_dir =  false  #  "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/standard_gcc/"  #  false  #
+# EVAL PYANNOTE HARDCODED PATH ANPASSEN WENN LAOD GCC ÄNDERN
+subset = "train"  # "train"  # "dev"
 scp_file = "data_mc/train/wav.scp"
 rttm_file = "data_mc/train/rttm"
 uem_file = "data_mc/train/all.uem"
@@ -66,13 +70,16 @@ channel_mode = "multichannel"
 
 [train_dataset.dataloader]
 batch_size = 16
-num_workers = 1
+num_workers = 1  # increase data loaders for gcc computation? instead maybe more prefatch
 drop_last = true
 pin_memory = true
+prefetch_factor = 5
 
 [validate_dataset]
 path = "dataset.DiarizationDataset"
 [validate_dataset.args]
+load_gcc_dir = false  #   "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/standard_gcc/"
+subset = "dev"  # "train"  # "dev"
 scp_file = "data_mc/dev/wav.scp"
 rttm_file = "data_mc/dev/rttm"
 uem_file = "data_mc/dev/all.uem"
@@ -86,4 +93,5 @@ batch_size = 16
 num_workers = 1
 drop_last = true
 pin_memory = true
+prefetch_factor = 5
 

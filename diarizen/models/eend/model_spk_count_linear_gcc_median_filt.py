@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+
+# Licensed under the MIT license.
+# Copyright 2020 CNRS (author: Herve Bredin, herve.bredin@irit.fr)
+# Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
+
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from functools import lru_cache
+
+from pyannote.audio.core.model import Model as BaseModel
+from pyannote.audio.utils.receptive_field import (
+    multi_conv_num_frames, 
+    multi_conv_receptive_field_size, 
+    multi_conv_receptive_field_center
+)
+
+from diarizen.models.module.conformer import ConformerEncoder, FiLM, ConformerEncoder_film
+from diarizen.models.module.wav2vec2.model import wav2vec2_model as wavlm_model
+# from diarizen.models.encoder_only.spk_counting import Model as spk_counting
+from diarizen.models.eend.model_wavlm_conformer_gcc_solo import Model as spk_counting
+from diarizen.models.module.wavlm_config import get_config
+
+class Model(BaseModel):
+    def __init__(
+        self,
+        wavlm_src: str = "wavlm_base",
+        wavlm_layer_num: int = 13,
+        wavlm_feat_dim: int = 768,
+        attention_in: int = 256,
+        ffn_hidden: int = 1024,
+        num_head: int = 4,
+        num_layer: int = 4,
+        kernel_size: int = 31,
+        dropout: float = 0.1,
+        use_posi: bool = False,
+        output_activate_function: str = False,
+        max_speakers_per_chunk: int = 4,
+        chunk_size: int = 5,
+        num_channels: int = 8,
+        selected_channel: int = 0,
+        sample_rate: int = 16000,
+        median = None,
+        max_num_spk = 4, # silence , 1 ,2 oder mehr als 2 spk
+        sin_cos = False,
+        ffn = None,
+        attention_in_aux = 216,
+        num_layer_aux = 3,
+        film = False,
+        film_layers = False,
+    ):
+        super().__init__(
+            num_channels=num_channels,
+            duration=chunk_size,
+            max_speakers_per_chunk=max_speakers_per_chunk
+        )
+        
+        self.chunk_size = chunk_size
+        self.sample_rate = sample_rate
+        self.selected_channel = selected_channel
+        self.median = median
+
+        # wavlm 
+        self.wavlm_model = self.load_wavlm(wavlm_src)
+        self.weight_sum = nn.Linear(wavlm_layer_num, 1, bias=False)
+
+        self.proj = nn.Linear(wavlm_feat_dim, attention_in)
+        self.lnorm = nn.LayerNorm(attention_in)
+
+        self.film_layers = film_layers
+        if self.film_layers:
+            self.conformer = ConformerEncoder_film(
+                attention_in=attention_in,
+                ffn_hidden=ffn_hidden,
+                num_head=num_head,
+                num_layer=num_layer,
+                kernel_size=kernel_size,
+                dropout=dropout,
+                use_posi=use_posi,
+                output_activate_function=output_activate_function,
+                film_dim=attention_in,
+            )
+        else:
+            self.conformer = ConformerEncoder(
+                attention_in=attention_in,
+                ffn_hidden=ffn_hidden,
+                num_head=num_head,
+                num_layer=num_layer,
+                kernel_size=kernel_size,
+                dropout=dropout,
+                use_posi=use_posi,
+                output_activate_function=output_activate_function
+            )
+
+        self.classifier = nn.Linear(attention_in, self.dimension)
+        self.activation = self.default_activation()
+        self.merge_linear = nn.Linear(attention_in + 1, attention_in)
+        if film:
+            self.film = FiLM(attention_in, 1)
+        self.max_num_spk = max_num_spk
+
+        self.spk_counting = spk_counting(
+            num_layer_aux=num_layer_aux,
+            attention_in = attention_in,
+            ffn_hidden = ffn_hidden,
+            num_head = num_head,
+            num_layer = num_layer,
+            dropout = dropout,
+            chunk_size = chunk_size,
+            use_posi = use_posi,
+            output_activate_function = output_activate_function,
+            max_speakers_per_chunk = max_speakers_per_chunk,
+            selected_channel = selected_channel,
+            max_num_spk = max_num_spk, # silence , 1 ,2 oder mehr als 2 spk
+            sin_cos = sin_cos,
+            ffn = ffn,
+            attention_in_aux = attention_in_aux,
+            )
+        for param in self.spk_counting.parameters():
+            param.requires_grad = False
+
+    def non_wavlm_parameters(self):
+        return [
+            *self.weight_sum.parameters(),
+            *self.proj.parameters(),
+            *self.lnorm.parameters(),
+            *self.conformer.parameters(),
+            *self.classifier.parameters(),
+            *self.merge_linear.parameters(),
+            # *self.spk_counting.parameters(),
+            *self.film.parameters(),
+        ]
+
+    @property
+    def dimension(self) -> int:
+        """Dimension of output"""
+        if isinstance(self.specifications, tuple):
+            raise ValueError("PyanNet does not support multi-tasking.")
+
+        if self.specifications.powerset:
+            return self.specifications.num_powerset_classes
+        else:
+            return len(self.specifications.classes)
+
+    @lru_cache
+    def num_frames(self, num_samples: int) -> int:
+        """Compute number of output frames
+
+        Parameters
+        ----------
+        num_samples : int
+            Number of input samples.
+
+        Returns
+        -------
+        num_frames : int
+            Number of output frames.
+        """
+
+        kernel_size = [10, 3, 3, 3, 3, 2, 2]
+        stride = [5, 2, 2, 2, 2, 2, 2]
+        padding = [0, 0, 0, 0, 0, 0, 0]
+        dilation = [1, 1, 1, 1, 1, 1, 1]
+
+        return multi_conv_num_frames(
+            num_samples,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+
+    def receptive_field_size(self, num_frames: int = 1) -> int:
+        """Compute size of receptive field
+
+        Parameters
+        ----------
+        num_frames : int, optional
+            Number of frames in the output signal
+
+        Returns
+        -------
+        receptive_field_size : int
+            Receptive field size.
+        """
+
+        kernel_size = [10, 3, 3, 3, 3, 2, 2]
+        stride = [5, 2, 2, 2, 2, 2, 2]
+        dilation = [1, 1, 1, 1, 1, 1, 1]
+
+        return multi_conv_receptive_field_size(
+            num_frames,
+            kernel_size=kernel_size,
+            stride=stride,
+            dilation=dilation,
+        )
+
+    def receptive_field_center(self, frame: int = 0) -> int:
+        """Compute center of receptive field
+
+        Parameters
+        ----------
+        frame : int, optional
+            Frame index
+
+        Returns
+        -------
+        receptive_field_center : int
+            Index of receptive field center.
+        """
+
+        kernel_size = [10, 3, 3, 3, 3, 2, 2]
+        stride = [5, 2, 2, 2, 2, 2, 2]
+        padding = [0, 0, 0, 0, 0, 0, 0]
+        dilation = [1, 1, 1, 1, 1, 1, 1]
+
+        return multi_conv_receptive_field_center(
+            frame,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+    
+    @property
+    def get_rf_info(self):     
+        """Return receptive field info to dataset
+        """
+
+        receptive_field_size = self.receptive_field_size(num_frames=1)
+        receptive_field_step = (
+            self.receptive_field_size(num_frames=2) - receptive_field_size
+        )
+        num_frames = self.num_frames(self.chunk_size * self.sample_rate)
+        duration = receptive_field_size / self.sample_rate
+        step=receptive_field_step / self.sample_rate
+        return num_frames, duration, step
+
+    def load_wavlm(self, source: str):
+        """
+        Load a WavLM model from either a config name or a checkpoint file.
+
+        Parameters
+        ----------
+        source : str
+            - If `source` is a config name (e.g., "wavlm_large_md_s80"), 
+            the model will be initialized using predefined configuration via `get_config()`.
+            - If `source` is a file path (e.g., "pytorch_model.bin", "model.ckpt", or any local .pt file),
+            the model will be loaded from the checkpoint, using its saved 'config' and 'state_dict'.
+
+        Returns
+        -------
+        model : nn.Module
+            Initialized WavLM model.
+        """
+        if os.path.isfile(source):
+            # Load from checkpoint file
+            ckpt = torch.load(source, map_location="cpu")
+
+            if "config" not in ckpt or "state_dict" not in ckpt:
+                raise ValueError("Checkpoint must contain 'config' and 'state_dict'.")
+
+            for k, v in ckpt["config"].items():
+                if 'prune' in k and v is not False:
+                    raise ValueError(f"Pruning must be disabled. Found: {k}={v}")
+
+            model = wavlm_model(**ckpt["config"])
+            model.load_state_dict(ckpt["state_dict"], strict=False)
+
+        else:
+            # Load from predefined config
+            config = get_config(source)
+            model = wavlm_model(**config)
+
+        return model
+
+
+    def wav2wavlm(self, in_wav, model):
+        """
+        transform wav to wavlm features
+        """
+        layer_reps, _ = model.extract_features(in_wav)
+        return torch.stack(layer_reps, dim=-1)
+
+    def median_filter_torch(self, x, kernel_size=7, f="median"):
+        """
+        x: Tensor (batch, frames, 1)
+        """
+        assert kernel_size % 2 == 1, "kernel_size should be an odd number"
+        pad = kernel_size // 2
+        x_padded = F.pad(x, (0, 0, pad, pad), mode="replicate")
+
+        # unfolded = x_padded.unfold(dimension=1, size=kernel_size, step=1)
+        # unfolded = unfolded.transpose(2, 3)  # [B, F, 1, K] -> [B, F, K, 1]
+        # # Shape: [batch, frames, kernel_size, 1]
+        if f == "max":
+            # x_med = unfolded.max(dim=2).values
+            x_filt = F.max_pool1d(
+                x_padded.transpose(1, 2),
+                kernel_size=kernel_size,
+                stride=1
+            ).transpose(1, 2)
+        # if f == "median":
+        #     x_filt = unfolded.median(dim=2).values
+        else:
+            raise ValueError(f"Wrong filter f = {f}, should be max or median")
+        # Shape: [batch, frames, 1]
+        return x_filt
+
+    def forward(self, waveforms: torch.Tensor, gcc_features) -> torch.Tensor:
+        """Pass forward
+
+        Parameters
+        ----------
+        waveforms : (batch, sample) or (batch, channel, sample)
+        gcc : (batch, frames, 1)
+
+        Returns
+        -------
+        scores : (batch, frame, classes)
+        """
+        assert waveforms.dim() == 3, f'waveforms.dim() = {waveforms.dim()}, should be 3, shape: {waveforms.shape}'
+        waveforms = waveforms[:, self.selected_channel, :]
+
+        wavlm_feat = self.wav2wavlm(waveforms, self.wavlm_model)
+        wavlm_feat = self.weight_sum(wavlm_feat)
+        wavlm_feat = torch.squeeze(wavlm_feat, -1)
+
+        outputs = self.proj(wavlm_feat)
+        outputs = self.lnorm(outputs)
+
+        with torch.no_grad():
+            pred = self.spk_counting(waveforms, gcc_features)
+        num_spk = torch.argmax(pred, dim=-1, keepdim=True).float().detach()
+
+        if self.median is not None:
+            num_spk = self.median_filter_torch(num_spk, kernel_size=9, f=self.median)
+
+        if hasattr(self, "film") and self.film is not None:
+            outputs = self.film(outputs, num_spk)
+        else:
+            outputs = torch.cat((outputs, num_spk), dim=-1)  # (batch, frames, attention_in + num_spk)
+            outputs = self.merge_linear(outputs)  # (batch, frames, attention_in)
+
+        if self.film_layers:
+            outputs = self.conformer(outputs, num_spk)
+        else:
+            outputs = self.conformer(outputs)
+
+        outputs = self.classifier(outputs)
+        outputs = self.activation(outputs)
+
+        return outputs
+
+
+if __name__ == '__main__':
+    wavlm_conf_name = 'wavlm_base_md_s80'
+    model = Model(wavlm_conf_name=wavlm_conf_name)
+    print(model)
+    x = torch.randn(2, 1, 32000)
+    y = model(x)
+    print(f'y: {y.shape}')

@@ -28,7 +28,7 @@ class Trainer(BaseTrainer):
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** (1. / 2)
-        return total_norm 
+        return total_norm
 
     def auto_clip_grad_norm_(self, model):
         grad_norm = self.compute_grad_norm(model)

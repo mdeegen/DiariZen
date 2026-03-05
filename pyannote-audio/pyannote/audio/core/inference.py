@@ -24,11 +24,15 @@ import warnings
 from pathlib import Path
 from typing import Callable, List, Optional, Text, Tuple, Union
 
+import h5py
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+# from masterarbeit.diarization_project.diarization_project.utils import num_spk
+from paderbox.io import load_json
 from pyannote.core import Segment, SlidingWindow, SlidingWindowFeature
 from pytorch_lightning.utilities.memory import is_oom_error
 
@@ -38,11 +42,54 @@ from pyannote.audio.core.task import Resolution
 from pyannote.audio.utils.multi_task import map_with_specifications
 from pyannote.audio.utils.powerset import Powerset
 from pyannote.audio.utils.reproducibility import fix_reproducibility
-
+import random
+import soundfile as sf
+import math
+import paderbox as pb
+from paderbox.io import dump_json, load_json
+from diarizen.spatial_features.gcc_phat import compute_vad_th, get_ch_pairs, get_gcc_for_all_channel_pairs_torch
+from diarizen.spatial_features.gcc_phat import (get_gcc_for_all_channel_pairs, channel_wise_activities,
+                                                convert_to_frame_wise_activities, get_dominant_time_frequency_mask)
 
 class BaseInference:
     pass
 
+def num_frames(L, n_fft, hop):
+    return math.floor((L - n_fft) / hop) + 1
+
+def median_filter_torch(x, kernel_size=7, f="median"):
+    """
+    x: Tensor (batch, frames, 1)
+    """
+    assert kernel_size % 2 == 1, "kernel_size should be an odd number"
+    pad = kernel_size // 2
+    x_padded = F.pad(x, (0, 0, pad, pad), mode="replicate")
+
+    unfolded = x_padded.unfold(dimension=1, size=kernel_size, step=1)
+    unfolded = unfolded.transpose(2, 3)  # [B, F, 1, K] -> [B, F, K, 1]
+    # Shape: [batch, frames, kernel_size, 1]
+    if f == "max":
+        x_med = unfolded.max(dim=2).values
+    if f == "median":
+        x_med = unfolded.median(dim=2).values
+    # Shape: [batch, frames, 1]
+    return x_med
+
+def pad_data(data, size=1024):
+    L = data.shape[-1]
+    n_fft_wavlm = 400
+    hop = 320
+    N_ref = num_frames(L, n_fft_wavlm, hop)
+
+    n_fft_big = size
+    N_big = num_frames(L, n_fft_big, hop)
+
+    L_target = (N_ref - 1) * hop + n_fft_big
+    pad = max(0, L_target - L)
+
+    last_vals = data[:, -1:]  # Shape (C,1)
+    pad_block = np.repeat(last_vals, pad, axis=-1)  # Shape (C,pad)
+    return np.concatenate([data, pad_block], axis=-1)
 
 class Inference(BaseInference):
     """Inference
@@ -194,7 +241,237 @@ class Inference(BaseInference):
         self.device = device
         return self
 
-    def infer(self, chunks: torch.Tensor, soft=False) -> Union[np.ndarray, Tuple[np.ndarray]]:
+    def get_dtype(self, value: int) -> str:
+        """Return the most suitable type for storing the
+        value passed in parameter in memory.
+
+        Parameters
+        ----------
+        value: int
+            value whose type is best suited to storage in memory
+
+        Returns
+        -------
+        str:
+            numpy formatted type
+            (see https://numpy.org/doc/stable/reference/arrays.dtypes.html)
+        """
+        # signe byte (8 bits), signed short (16 bits), signed int (32 bits):
+        types_list = [(127, "b"), (32_768, "i2"), (2_147_483_648, "i")]
+        filtered_list = [
+            (max_val, type) for max_val, type in types_list if max_val > abs(value)
+        ]
+        if not filtered_list:
+            return "i8"  # signed long (64 bits)
+        return filtered_list[0][1]
+
+    def compute_gcc(self, waveforms_mc, frame_size_gcc=1024, frame_shift_gcc=320, avg_len_gcc=4,
+                    search_range_gcc=10, f_max_gcc=3500, f_min=125, apply_ifft=True):
+        """
+        Compute GCC features from multichannel waveforms.
+        returns:
+            batch_gcc_features: (batch, frame, channel, channel, search_range)
+        """
+        # TODO: try different stft values for better gcc but need fit frames of WAVLM
+        sigs_stft = pb.transform.stft(waveforms_mc, frame_size_gcc, frame_shift_gcc,
+                                      pad=False, fading=False)
+        sigs_stft = torch.from_numpy(sigs_stft).to(self.device)
+        gcc_features = get_gcc_for_all_channel_pairs_torch(sigs_stft, f_min=f_min, f_max=f_max_gcc,apply_ifft=apply_ifft)
+        return gcc_features
+
+
+    def extract_wavforms(self, path, start, end, num_channels=4, sample_rate=None ):
+        # 4 for debugging and smaller memory and faster dev
+        if not sample_rate:
+            data, sample_rate = sf.read(path)
+            # print(data.shape, sample_rate, path)
+            data = np.einsum('tc->ct', data)  # [channel, time]
+            ths = compute_vad_th(data)
+            return sample_rate, ths
+        else:
+            start = int(start * sample_rate)
+            # TODO' random channel selection
+            end = int(end * sample_rate)
+            data, sample_rate = sf.read(path, start=start, stop=end)
+            assert sample_rate == sample_rate, f"Sample rate mismatch: {sample_rate} != {self.sample_rate}"
+
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            else:
+                data = np.einsum('tc->ct', data)
+            data = data[:num_channels, :]
+            return data
+
+    def get_gccs(self, path, start, end, th, sample_rate, framewise=False, vad=False, frame_size_gcc=400, frame_shift_gcc=320, ):
+        data = self.extract_wavforms(path, start, end, sample_rate=sample_rate)
+        gccs = self.compute_gcc(data, ths=th, framewise=framewise, frame_size_gcc=frame_size_gcc,
+                           frame_shift_gcc=frame_shift_gcc)
+        return gccs
+
+    def load_gcc(self, file_stem: str) -> torch.Tensor:
+        """Load GCCs for a specific chunk index from a file.
+        """
+        # load_gcc_dir = "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/standard_gcc/"
+        load_gcc_dir = "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/gcc_size4096_shift311_no_freq_filt/"
+        # load_gcc_dir = "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/gcc_size4096_shift311_2/"
+        # TODO: LOADING CHUNKS DEPENDS ON STFT PARAMS
+
+        # if load_gcc_dir == "base":
+        #     return torch.zeros((32, 1, 1, 1))
+        load_gcc_dir = Path(load_gcc_dir) / "test"
+        index = load_json(load_gcc_dir / 'index.json')
+        if not load_gcc_dir:
+            raise FileNotFoundError(f"GCC directory {load_gcc_dir} does not exist")
+        segment_id = f"{file_stem}"
+        if file_stem not in index:
+            raise KeyError(f"File stem '{file_stem}' not found in GCC index")
+        h5_filename = Path(index[file_stem])
+        if not h5_filename.is_absolute():
+            h5_filename = load_gcc_dir / h5_filename
+        if not h5_filename.exists():
+            raise FileNotFoundError(f"HDF5 file {h5_filename} not found")
+        with h5py.File(h5_filename, 'r') as f:
+            if file_stem not in f:
+                raise KeyError(f"Group '{file_stem}' not found in {h5_filename}")
+            grp = f[file_stem]
+            if segment_id not in grp:
+                raise KeyError(f"Segment ID '{segment_id}' not found in group '{file_stem}'")
+            gcc_features = grp[segment_id][()]
+
+        if gcc_features.shape[1] == 6:
+            return gcc_features
+
+        if gcc_features.shape[1] == 28:  # todo: use 4 channels for development
+            ch_pairs_gcc = get_ch_pairs(8)
+        elif gcc_features.shape[1] == 21:
+            ch_pairs_gcc = get_ch_pairs(7)
+        elif gcc_features.shape[1] == 15:
+            ch_pairs_gcc = get_ch_pairs(6)
+        elif gcc_features.shape[1] == 10:
+            ch_pairs_gcc = get_ch_pairs(5)
+
+        ch_pairs_4 = set(get_ch_pairs(4))
+        chs = [i for i, pair in enumerate(ch_pairs_gcc) if pair in ch_pairs_4]
+        gcc_features = gcc_features[:, chs, :]
+        return gcc_features
+
+    def get_chunk_gccs(self, file_stem: str, chunk_index: int, batch_size, gcc_features, frame_shift_gcc=320, sample_rate=16000) -> torch.Tensor:
+        """Load GCCs for a specific chunk index from a file.
+        """
+        gcc_features_batch = []
+        for i in range(batch_size):
+            start = round((chunk_index + i ) * self.step, 2)
+            end = start + self.duration
+
+            # get chunk from gcc frames:
+            frame_shift_sec = frame_shift_gcc / sample_rate  # 320 / 16000 = 0.02 s
+            start_frame = int(start / frame_shift_sec)
+            end_frame = start_frame + 399 # 400 is the frame size for gcc features
+            # TODO STFT params 399 anpassen
+            gcc_chunk = gcc_features[start_frame:end_frame]
+            gcc_features_batch.append(gcc_chunk)
+
+
+        try:
+            gcc_features_batch = torch.tensor(np.array(gcc_features_batch), dtype=torch.float32)
+        except ValueError as e:
+            print(
+                f"Error converting GCC features to tensor: {e}. "
+                f"Check if the shape of the loaded GCC features is correct."
+            )
+            import pdb
+            pdb.set_trace()
+        return gcc_features_batch
+
+    def rttm2label(self, rttm_file, current_session):
+        '''
+        SPEAKER train100_306 1 15.71 1.76 <NA> <NA> 5456 <NA> <NA>
+        '''
+        annotations = []
+        unique_label_lst = []
+        with open(rttm_file, 'r') as file:
+            for seg_idx, line in enumerate(file):
+                line = line.split()
+                session, start, dur = line[1], line[3], line[4]
+
+                if session != current_session:
+                    continue
+
+                start = float(start)
+                end = start + float(dur)
+                spk = line[-2] if line[-2] != "<NA>" else line[-3]
+
+                if spk not in unique_label_lst:
+                    unique_label_lst.append(spk)
+
+                label_idx = unique_label_lst.index(spk)
+                annotations.append((
+                        start,
+                        end,
+                        label_idx
+                    ))
+        segment_dtype = [
+            ("start", "f"),
+            ("end", "f"),
+            ("label_idx", self.get_dtype(max(a[2] for a in annotations)) if annotations else "i4"),
+        ]
+        return np.array(annotations, dtype=segment_dtype)
+
+    def get_chunk_start_end(self, batch_start_idx, batch_offset, step, duration):
+        """
+        Berechnet Start- und Endzeitpunkt eines Chunks in Sekunden.
+
+        Args:
+            batch_start_idx (int): Startindex des aktuellen Batches (z.B. c).
+            batch_offset (int): Offset innerhalb des Batches (z.B. i).
+            step (float): Schrittweite zwischen den Chunks in Sekunden.
+            duration (float): Dauer eines Chunks in Sekunden.
+
+        Returns:
+            tuple: (chunk_start, chunk_end) in Sekunden.
+        """
+        chunk_start = (batch_start_idx + batch_offset) * step
+        chunk_end = chunk_start + duration
+        return chunk_start, chunk_end
+
+    def load_num_spk(self, annotations_session, chunk_start, chunk_end):
+        model_rf_duration = 0.025
+        model_rf_step = 0.02
+        model_num_frames = 399
+
+        chunked_annotations = annotations_session[
+            (annotations_session["start"] < chunk_end) & (annotations_session["end"] > chunk_start)
+            ]
+
+        # discretize chunk annotations at model output resolution
+        step = model_rf_step
+        half = 0.5 * model_rf_duration
+
+        start = np.maximum(chunked_annotations["start"], chunk_start) - chunk_start - half
+        start_idx = np.maximum(0, np.round(start / step)).astype(int)
+
+        end = np.minimum(chunked_annotations["end"], chunk_end) - chunk_start - half
+        end_idx = np.round(end / step).astype(int)
+
+        # get list and number of labels for current scope
+        labels = list(np.unique(chunked_annotations['label_idx']))
+        num_labels = len(labels)
+
+        mask_label = np.zeros((model_num_frames, num_labels), dtype=np.uint8)
+
+        # map labels to indices
+        mapping = {label: idx for idx, label in enumerate(labels)}
+        for start, end, label in zip(
+                start_idx, end_idx, chunked_annotations['label_idx']
+        ):
+            mapped_label = mapping[label]
+            mask_label[start: end + 1, mapped_label] = 1
+
+
+        num_spk = np.sum(mask_label, axis=-1, keepdims=True)
+        return num_spk
+
+    def infer(self, chunks: torch.Tensor, gccs, soft=False, spk_accuracy=False) -> Union[np.ndarray, Tuple[np.ndarray]]:
         """Forward pass
 
         Takes care of sending chunks to right device and outputs back to CPU
@@ -212,7 +489,9 @@ class Inference(BaseInference):
 
         with torch.inference_mode():
             try:
-                outputs = self.model(chunks.to(self.device))
+                outputs = self.model(chunks.to(self.device), gccs.to(self.device))
+                if spk_accuracy:
+                    return outputs
             except RuntimeError as exception:
                 if is_oom_error(exception):
                     raise MemoryError(
@@ -229,12 +508,21 @@ class Inference(BaseInference):
             self.model.specifications, __convert, outputs, self.conversion
         )
 
+    def get_mic_selection(self, rec):
+        if rec.startswith(("S3")):
+            mics = [1, 3, 4, 6]  # for NSF
+        else:
+            mics = [0, 2, 4, 6]  # default
+        return mics
+
     def slide(
         self,
         waveform: torch.Tensor,
         sample_rate: int,
         hook: Optional[Callable],
-        soft: bool = False
+        path,
+        soft: bool = False,
+        out_dir=None
     ) -> Union[SlidingWindowFeature, Tuple[SlidingWindowFeature]]:
         """Slide model on a waveform
 
@@ -256,13 +544,15 @@ class Inference(BaseInference):
             Model output. Shape is (num_chunks, dimension) for chunk-level tasks,
             and (num_frames, dimension) for frame-level tasks.
         """
-
+        # TODO: MC for multi channel recordings still mc and get first channel later
+        # waveform_mc = waveform.numpy()
+        # waveform = torch.unsqueeze(waveform[0], 0)  # force to use the SDM data
         window_size: int = self.model.audio.get_num_samples(self.duration)
         step_size: int = round(self.step * sample_rate)
         _, num_samples = waveform.shape
 
         def __frames(
-            receptive_field, specifications: Optional[Specifications] = None
+                receptive_field, specifications: Optional[Specifications] = None
         ) -> SlidingWindow:
             if specifications.resolution == Resolution.CHUNK:
                 return SlidingWindow(start=0.0, duration=self.duration, step=self.step)
@@ -278,13 +568,15 @@ class Inference(BaseInference):
                 waveform.unfold(1, window_size, step_size),
                 "channel chunk frame -> chunk channel frame",
             )
+            # num_chunks_test = np.floor((num_samples - window_size) / step_size) + 1
+            # print(f"Chunks shape: {chunks.shape}, should be chunks: ", num_chunks_test)
             num_chunks, _, _ = chunks.shape
         else:
             num_chunks = 0
 
         # prepare last incomplete chunk
         has_last_chunk = (num_samples < window_size) or (
-            num_samples - window_size
+                num_samples - window_size
         ) % step_size > 0
         if has_last_chunk:
             # pad last chunk with zeros
@@ -307,32 +599,172 @@ class Inference(BaseInference):
             output.append(batch_output)
             return
 
-        # slide over audio chunks in batch
-        for c in np.arange(0, num_chunks, self.batch_size):
-            batch: torch.Tensor = chunks[c : c + self.batch_size]
+        file_stem = Path(path).stem
 
-            batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch, soft=soft)
+        # num_correct = 0
+        # num_total = 0
+        # num_correct_ov = 0
+        # num_total_ov = 0
+        # over = 0
+        # under = 0
+        # frame_deltas = []
+        rttm_file = "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc/data_mc/test/rttm"
+        if not Path(rttm_file).exists():
+            rttm_file = "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc/data_no_chime/test/rttm"
+
+        annotations_session = self.rttm2label(rttm_file, file_stem)
+        # print(f"Sliding over {num_chunks} chunks of {self.duration:g}s each, ")
+
+        # TODO: (Un-)comment to switch between loading precomputed GCCs and ground truth num spk
+        # gcc_features = self.load_gcc(file_stem)
+
+
+        for c in np.arange(0, num_chunks, self.batch_size):
+            # c = c + 5 * self.batch_size
+            batch: torch.Tensor = chunks[c : c + self.batch_size]
+            num_spks = []
+
+            for i in range(batch.shape[0]):
+                chunk_start, chunk_end = self.get_chunk_start_end(c, i , self.step, self.duration)
+                num_spk = self.load_num_spk(annotations_session, chunk_start, chunk_end)
+                num_spks.append(num_spk)
+
+            num_spks = torch.from_numpy(np.stack(num_spks).astype(np.float32)).float().to(self.device)
+            # TODO get gcc features
+            # gccs = self.get_chunk_gccs(file_stem, c, batch_size=batch.shape[0], gcc_features=gcc_features)
+            gccs = []
+            fmin = 125
+            fmax = 3500
+            fft_size = 1024
+            median = "max"  #  False
+            kernel_size = 9     ## 9 for ffn and 25 for 9Layer
+            spk_accuracy = False
+            apply_ifft = False
+            k_min = int(np.round(fmin / (sample_rate / 2) * (fft_size // 2 + 1)))
+            k_max = int(np.round(fmax / (sample_rate / 2) * (fft_size // 2 + 1)))
+            for i in range(batch.shape[0]):
+                data = batch[i]
+                data = pad_data(data, size=fft_size)
+
+                sigs_stft = pb.transform.stft(data[0], size=fft_size, shift=320,
+                                              pad=False, fading=False)
+                magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max]).to(self.device)  # (frames, freq))
+
+                mics = self.get_mic_selection(rec=file_stem)
+                # print(data.shape, mics, session)
+
+                gcc_features = self.compute_gcc(data[mics], frame_size_gcc=fft_size, frame_shift_gcc=320, f_max_gcc=fmax,
+                                                f_min=fmin, apply_ifft=apply_ifft)
+
+                gccs.append(torch.concat([gcc_features, magnitude[:, None, :]], dim=1))
+
+            gccs = torch.stack(gccs, dim=0).to(torch.complex64)
+            # gccs = num_spks
+            batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch, gccs, soft=soft, spk_accuracy=spk_accuracy)
+
+            # print(num_spks.shape, batch_outputs.shape)
+            # if spk_accuracy:
+            #     # for n, (spk_gt, pred) in enumerate(zip(num_spks, batch_outputs)):
+            #
+            #     pred_labels = torch.argmax(batch_outputs, dim=-1, keepdim=True)
+            #     if median:
+            #         pred_labels = median_filter_torch(pred_labels, kernel_size=kernel_size, f=median)
+            #     pred_labels = pred_labels.squeeze()
+            #     gt_labels = num_spks.squeeze()
+            #
+            #
+            #     hits = (pred_labels == gt_labels).sum().item()
+            #     total = pred_labels.numel()
+            #
+            #     # n = 1
+            #     # for i in range(40, len(gt_labels[n]), 100):
+            #     #     print("t", gt_labels[n, i:i + 20].int().tolist(), flush=True)
+            #     #     print("e", pred_labels[n, i:i + 20].int().tolist(), flush=True)
+            #     #     print("p", batch_outputs[n, i:i+20], flush=True)
+            #
+            #     num_correct += hits
+            #     num_total += total
+            #     frame_deltas.extend((pred_labels - gt_labels).tolist())
+            #
+            #     under += torch.sum(pred_labels < gt_labels)
+            #     over += torch.sum((pred_labels > gt_labels))
+            #
+            #     hits_ov = ((pred_labels == gt_labels) & (pred_labels >= 2)).sum().item()
+            #     total_ov = (gt_labels >= 2).sum().item()
+            #     num_correct_ov += hits_ov
+            #     num_total_ov += total_ov
+            #     # print(f"Chunk {c}: Accuracy: {hits / total if total > 0 else 0.0:.4f} ({hits}/{total})")
+            #     # print(f"Chunk {c}: Accuracy ov: {hits_ov / total_ov if total_ov > 0 else 0.0:.4f} ({hits_ov}/{total_ov})")
+            #     # assert False
+            #
+            #     batch_outputs = batch_outputs.cpu().numpy()
+            # print(f"Processed chunk {c}/{num_chunks}, ", batch_outputs.shape, flush=True)
 
             _ = map_with_specifications(
                 self.model.specifications, __append_batch, outputs, batch_outputs
             )
-
             if hook is not None:
                 hook(completed=c + self.batch_size, total=num_chunks + has_last_chunk)
-
         # process orphan last chunk
         if has_last_chunk:
-            last_outputs = self.infer(last_chunk[None], soft=soft)
+
+            # chunk_start, chunk_end = self.get_chunk_start_end(num_chunks, 0 , self.step, self.duration)
+            # num_spks = self.load_num_spk(annotations_session, chunk_start, chunk_end)
+            # num_spks = torch.from_numpy(num_spks.astype(np.float32)).float().to(self.device)
+            # # TODO: ground truth then comment next line out
+            # # gccs = num_spks
+            gccs = gccs[-1]
+
+            last_outputs = self.infer(last_chunk[None], gccs[None], soft=soft, spk_accuracy=spk_accuracy)
+            # if spk_accuracy:
+            #     # for spk_gt, pred in zip(num_spks, last_outputs):
+            #         # pred_labels = torch.argmax(pred, dim=-1)
+            #     pred_labels = torch.argmax(last_outputs, dim=-1, keepdim=True)
+            #     if median:
+            #         pred_labels = median_filter_torch(pred_labels, kernel_size=kernel_size, f=median)
+            #
+            #     pred_labels = pred_labels.squeeze()
+            #     gt_labels = num_spks.squeeze()
+            #
+            #     hits = (pred_labels == gt_labels).sum().item()
+            #     total = pred_labels.numel()
+            #     num_correct += hits
+            #     num_total += total
+            #     hits_ov = ((pred_labels == gt_labels) & (pred_labels >= 2)).sum().item()
+            #     total_ov = (gt_labels >= 2).sum().item()
+            #     num_correct_ov += hits_ov
+            #     num_total_ov += total_ov
+            #
+            #     # frame_deltas.extend((pred_labels - gt_labels).tolist())
+            #     last_outputs = last_outputs.cpu().numpy()
 
             _ = map_with_specifications(
                 self.model.specifications, __append_batch, outputs, last_outputs
             )
-
             if hook is not None:
                 hook(
                     completed=num_chunks + has_last_chunk,
                     total=num_chunks + has_last_chunk,
                 )
+
+        # if spk_accuracy:
+        #     ### Accuracy for speaker counting
+        #     accuracy = num_correct / num_total if num_total > 0 else 0.0
+        #     under = under / num_total if num_total > 0 else 0.0
+        #     over = over / num_total if num_total > 0 else 0.0
+        #     print(f"under: {under:.4f}, over: {over:.4f}")
+        #     print(f"Accuracy: {accuracy:.4f}")
+        #     accuracy_ov = num_correct_ov / num_total_ov if num_total_ov > 0 else 0.0
+        #     print(f"Accuracy: {accuracy_ov:.4f}")
+        #     # assert False
+        #     if out_dir:
+        #         out_dir = Path(out_dir)
+        #         out_dir.mkdir(parents=True, exist_ok=True)
+        #         acc_file = out_dir / f"{file_stem}_spk_counting_accuracy.json"
+        #         dump_json({"accuracy": accuracy, "accuracy_ov": accuracy_ov}, acc_file)
+        #
+        #         delta_file = out_dir / f"{file_stem}_spk_counting_frame_deltas.npy"
+        #         # np.save(delta_file, np.array(frame_deltas))
 
         def __vstack(output: List[np.ndarray], **kwargs) -> np.ndarray:
             return np.vstack(output)
@@ -342,20 +774,20 @@ class Inference(BaseInference):
         )
 
         def __aggregate(
-            outputs: np.ndarray,
-            frames: SlidingWindow,
-            specifications: Optional[Specifications] = None,
+                outputs: np.ndarray,
+                frames: SlidingWindow,
+                specifications: Optional[Specifications] = None,
         ) -> SlidingWindowFeature:
             # skip aggregation when requested,
             # or when model outputs just one vector per chunk
             # or when model is permutation-invariant (and not post-processed)
             if (
-                self.skip_aggregation
-                or specifications.resolution == Resolution.CHUNK
-                or (
+                    self.skip_aggregation
+                    or specifications.resolution == Resolution.CHUNK
+                    or (
                     specifications.permutation_invariant
                     and self.pre_aggregation_hook is None
-                )
+            )
             ):
                 frames = SlidingWindow(
                     start=0.0, duration=self.duration, step=self.step
@@ -389,7 +821,7 @@ class Inference(BaseInference):
         )
 
     def __call__(
-        self, file: AudioFile, hook: Optional[Callable] = None, soft: bool = False
+        self, file: AudioFile, path, hook: Optional[Callable] = None, soft: bool = False, out_dir=None
     ) -> Union[
         Tuple[Union[SlidingWindowFeature, np.ndarray]],
         Union[SlidingWindowFeature, np.ndarray],
@@ -419,7 +851,7 @@ class Inference(BaseInference):
         waveform, sample_rate = self.model.audio(file)
 
         if self.window == "sliding":
-            return self.slide(waveform, sample_rate, hook=hook, soft=soft)
+            return self.slide(waveform, sample_rate, path=path, hook=hook, soft=soft, out_dir=out_dir)
 
         outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(waveform[None], soft=soft)
 
@@ -495,6 +927,7 @@ class Inference(BaseInference):
 
             def __shift(output: SlidingWindowFeature, **kwargs) -> SlidingWindowFeature:
                 frames = output.sliding_window
+            # config und precompute anpassen
                 shifted_frames = SlidingWindow(
                     start=chunk.start, duration=frames.duration, step=frames.step
                 )

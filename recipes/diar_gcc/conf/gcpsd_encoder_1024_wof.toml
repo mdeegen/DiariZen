@@ -1,6 +1,7 @@
 [meta]
 save_dir = "exp"
 seed = 3407
+gcpsd = true
 
 [finetune]
 finetune = false
@@ -23,7 +24,7 @@ validation_interval = 1
 freeze_wavlm = false
 lr_decay = false
 use_one_cycle_lr = false
-validation_before_training = true # true       # activate validation activate validation activate validation activate validation
+validation_before_training = false # true       # activate validation activate validation activate validation activate validation
 preheat_epochs = 0
 
 [optimizer_small]
@@ -41,7 +42,8 @@ path = "diarizen.models.encoder_only.spk_counting.Model" # "model_mc_channel_att
 [model.args]
 num_layer_aux = 3
 max_num_spk = 4
-attention_in_aux = 2049
+sin_cos = true
+attention_in_aux = 516 # 2*513 + 0 0 für /4
 attention_in = 256
 ffn_hidden = 1024
 num_head = 4

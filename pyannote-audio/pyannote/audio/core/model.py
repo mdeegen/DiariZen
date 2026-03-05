@@ -128,6 +128,35 @@ def average_states(
         avg_state[key] = avg_state[key] / qty
     return avg_state
 
+class OverlapDiarizationErrorRate(Metric):
+    """TorchMetrics-Metric ov DER (multi-speaker)."""
+    def __init__(self, threshold=0.5, dist_sync_on_step=False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.der = DiarizationErrorRate(threshold)
+        self.add_state("all_preds", default=[], dist_reduce_fx=None)
+        self.add_state("all_targets", default=[], dist_reduce_fx=None)
+
+    def update(self, preds: torch.Tensor, targets: torch.Tensor):
+        """
+        preds: (B, T, num_speakers) Tensor, probs oder binary
+        targets: (B, T, num_speakers) Tensor, binary
+        """
+        preds_bin = (preds > 0.5).float()
+        targets_bin = targets.float()
+        # Overlap-Frames
+        overlap_mask = targets_bin.sum(dim=-1) > 1  # shape (B,T)
+
+        if overlap_mask.any():
+            self.all_preds.append(preds_bin[overlap_mask].unsqueeze(0))
+            self.all_targets.append(targets_bin[overlap_mask].unsqueeze(0))
+
+    def compute(self):
+        if len(self.all_preds) == 0:
+            return torch.tensor(0.0)
+        preds_cat = torch.cat(self.all_preds)
+        targets_cat = torch.cat(self.all_targets)
+        return self.der(preds_cat, targets_cat)
+
 
 class Model(nn.Module):
     """ A simple model wrapper to pyannote.audio.core.model
@@ -240,6 +269,7 @@ class Model(nn.Module):
         if self.specifications.powerset:
             return {
                 "DiarizationErrorRate": DiarizationErrorRate(0.5),
+                "OverlapDiarizationErrorRate": OverlapDiarizationErrorRate(0.5),
                 "DiarizationErrorRate/Confusion": SpeakerConfusionRate(0.5),
                 "DiarizationErrorRate/Miss": MissedDetectionRate(0.5),
                 "DiarizationErrorRate/FalseAlarm": FalseAlarmRate(0.5),

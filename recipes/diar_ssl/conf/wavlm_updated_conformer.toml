@@ -34,7 +34,7 @@ lr = 1e-3
 [model]
 path = "diarizen.models.eend.model_wavlm_conformer.Model"
 [model.args]
-wavlm_src = "/YOUR_PATH/WavLM-Base+.pt"
+wavlm_src = "/mnt/matylda5/qdeegen/models/converted/wavlm-base-converted.bin"
 wavlm_layer_num = 13
 wavlm_feat_dim = 768
 attention_in = 256
@@ -51,9 +51,9 @@ max_speakers_per_chunk = 4
 [train_dataset]
 path = "dataset.DiarizationDataset"
 [train_dataset.args]
-scp_file = "data/AMI_AliMeeting_AISHELL4/train/wav.scp"
-rttm_file = "data/AMI_AliMeeting_AISHELL4/train/rttm"
-uem_file = "data/AMI_AliMeeting_AISHELL4/train/all.uem"
+scp_file = "data_aaa/AMI_AliMeeting_AISHELL4/train/wav.scp"
+rttm_file = "data_aaa/AMI_AliMeeting_AISHELL4/train/rttm"
+uem_file = "data_aaa/AMI_AliMeeting_AISHELL4/train/all.uem"
 chunk_size = 8
 chunk_shift = 6
 sample_rate = 16000
@@ -67,9 +67,9 @@ pin_memory = true
 [validate_dataset]
 path = "dataset.DiarizationDataset"
 [validate_dataset.args]
-scp_file = "data/AMI_AliMeeting_AISHELL4/dev/wav.scp"
-rttm_file = "data/AMI_AliMeeting_AISHELL4/dev/rttm"
-uem_file = "data/AMI_AliMeeting_AISHELL4/dev/all.uem"
+scp_file = "data_aaa/AMI_AliMeeting_AISHELL4/dev/wav.scp"
+rttm_file = "data_aaa/AMI_AliMeeting_AISHELL4/dev/rttm"
+uem_file = "data_aaa/AMI_AliMeeting_AISHELL4/dev/all.uem"
 chunk_size = 8
 chunk_shift = 8
 sample_rate = 16000
@@ -79,4 +79,3 @@ batch_size = 8
 num_workers = 1
 drop_last = true
 pin_memory = true
-

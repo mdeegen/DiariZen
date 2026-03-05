@@ -268,7 +268,7 @@ class Model(BaseModel):
         # Shape: [batch, frames, 1]
         return x_med
 
-    def forward(self, waveforms: torch.Tensor, gcc_features, t) -> torch.Tensor:
+    def forward(self, waveforms: torch.Tensor, gcc_features) -> torch.Tensor:
         """Pass forward
 
         Parameters
@@ -293,11 +293,19 @@ class Model(BaseModel):
         pred = self.spk_counting(waveforms, gcc_features)
         num_spk = torch.argmax(pred, dim=-1, keepdim=True)
 
-        # todo: debug
-        t = torch.sum(t, dim=-1)  # sum over classes
-        for f in range(num_spk.shape[1]):
-            print(f't: {t[:, f]}, num_spk: {num_spk[:, f]}')
-        assert False
+        # num_spk = torch.argmax(pred, dim=-1, keepdim=False)
+        # print( num_spk.shape)
+        # # todo: debug
+        # t = torch.sum(t, dim=-1)  # sum over classes
+        # for f in range(0, num_spk.shape[1], 10):
+        #     if 2 in t[3, f:f+10]:
+        #         print(f' t: {t[3, f:f+10]},\n n: {num_spk[3, f:f+10]}\n p: {pred[3, f:f+10]}', )
+        #     else:
+        #         print(f' t: {t[3, f:f+10]},\n n: {num_spk[3, f:f+10]}' )
+        # assert False
+
+
+
         num_spk = self.median_filter_torch(num_spk, kernel_size=7)
 
         outputs = torch.cat((outputs, num_spk), dim=-1)  # (batch, frames, attention_in + num_spk)

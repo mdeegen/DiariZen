@@ -299,6 +299,7 @@ class Audio:
 
         channel = file.get("channel", None)
 
+#       TODO: hier copy von waveform zurückgeben für gccs berechnung und durchführen wenn nötig
         if channel is not None:
             waveform = waveform[channel : channel + 1]
 

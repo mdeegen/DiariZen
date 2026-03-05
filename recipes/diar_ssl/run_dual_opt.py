@@ -18,7 +18,7 @@ from dataset import _collate_fn
 from functools import partial
 
 def run(config, resume):
-    init_logging_logger(config)
+    logger = init_logging_logger(config)
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -30,10 +30,11 @@ def run(config, resume):
 
     model = instantiate(config["model"]["path"], args=config["model"]["args"])
     model_num_frames, model_rf_duration, model_rf_step = model.get_rf_info
-    
+    logger.info(f"model_num_frames: {model_num_frames}, model_rf_duration: {model_rf_duration}, model_rf_step: {model_rf_step}")
+
     if config["finetune"]["finetune"]:
         accelerator.print('fine-tuning...')
-        model = average_ckpt(config["finetune"]["ckpt_dir"], model, avg_ckpt_num=config["finetune"]["avg_ckpt_num"])
+        model = average_ckpt(config["finetune"]["ckpt_dir"], model, avg_ckpt_num=config["finetune"]["avg_ckpt_num"], load_wavlm_only=config["finetune"]["load_wavlm_only"])
 
     optimizer_small = instantiate(
         config["optimizer_small"]["path"],

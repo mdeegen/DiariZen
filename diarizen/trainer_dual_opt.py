@@ -9,6 +9,7 @@ import time
 from functools import partial
 from pathlib import Path
 
+from sklearn.metrics import confusion_matrix
 import json
 from os.path import join
 
@@ -20,8 +21,9 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from torch.utils.data import DataLoader
 from torchinfo import summary
+import shutil
 from tqdm.auto import tqdm
-
+import torch.profiler
 from diarizen.logger import TensorboardLogger
 from diarizen.optimization import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
 from diarizen.trainer_utils import TrainerState
@@ -34,6 +36,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
 logger = get_logger(__name__)
 
 
+
 class Trainer:
     def __init__(
         self,
@@ -43,6 +46,8 @@ class Trainer:
         model,
         optimizer_small,
         optimizer_big,
+        aux_loss = False,
+        spk_count_loss = False,
     ):
         """Create an instance of BaseTrainer for training, validation, and fine-tuning."""
         self.config = config
@@ -56,6 +61,10 @@ class Trainer:
         self.rank = accelerator.device
         self.device = accelerator.device  # alias of rank
 
+        # Store source code files
+        if self.accelerator.is_local_main_process:
+            self.track_files()
+
         # Model
         self.model = model
         self.optimizer_small = optimizer_small
@@ -66,7 +75,19 @@ class Trainer:
 
         # Trainer.train args
         self.trainer_config = config["trainer"]["args"]
+        self.num_spk = self.trainer_config.get("num_spk", False)
+        self.num_spk_and_gcc = self.trainer_config.get("num_spk_and_gcc", False)
+        self.spk_prob = self.trainer_config.get("spk_prob", False)
+        self.ov = self.trainer_config.get("ov", False)
+        self.weighted_loss = self.trainer_config.get("weighted_loss", False)
+        self.focal_loss = self.trainer_config.get("focal_loss", False)
+        self.ov_loss = self.trainer_config.get("ov_loss", False)
+        self.spk_count_loss = self.trainer_config.get("spk_count_loss", False)
+        self.bce_loss = self.trainer_config.get("bce_loss", False)
+        self.aux_loss = self.trainer_config.get("aux_loss", False)
         self.debug = self.trainer_config.get("debug", False)
+        self.compute_second_der = self.trainer_config.get("compute_second_der", True)
+
         self.max_steps = self.trainer_config.get("max_steps", 0)
         self.max_epochs = self.trainer_config.get("max_epochs", sys.maxsize)
         self.max_grad_norm = self.trainer_config.get("max_grad_norm", 0)
@@ -77,8 +98,10 @@ class Trainer:
         self.plot_lr = self.trainer_config.get("plot_lr", False)
         self.validation_interval = self.trainer_config.get("validation_interval", 1)
         self.max_num_checkpoints = self.trainer_config.get("max_num_checkpoints", 10)
-        self.scheduler_name = self.trainer_config.get("scheduler_name", "constant_schedule_with_warmup")
+        self.scheduler_name = self.trainer_config.get("scheduler_name", "linear_schedule_with_warmup")
         self.warmup_steps = self.trainer_config.get("warmup_steps", 0)
+        self.warmup_steps_enc = self.trainer_config.get("warmup_steps_enc", 0)
+        self.preheat_epochs = self.trainer_config.get("preheat_epochs", 0)
         self.warmup_ratio = self.trainer_config.get("warmup_ratio", 0.0)
         self.gradient_accumulation_steps = self.trainer_config.get("gradient_accumulation_steps", 1)
 
@@ -136,6 +159,11 @@ class Trainer:
         self.writer = TensorboardLogger(self.tb_log_dir.as_posix())
         self.writer.log_config(config)
 
+        # import wandb
+        # wandb.init(project="diarizen", dir=self.tb_log_dir.as_posix())
+        # wandb.config.update(config)
+        # self.writer = wandb
+
         with open(self.config_path.as_posix(), "w") as handle:
             toml.dump(config, handle)
 
@@ -145,6 +173,27 @@ class Trainer:
 
         # Model summary
         logger.info(f"\n {summary(self.model, verbose=0)}")
+
+    def track_files(self):
+        out_dir = self.source_code_backup_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        save_dirs = [
+            "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/diarizen",
+            "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/recipes/diar_gcc",
+            "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc",
+        ]
+        patterns = ["*.py", "*.toml", "*.sh"]
+        for folder in save_dirs:
+            for pattern in patterns:
+                for file in Path(folder).glob(pattern):
+                    # Erzeuge einen eindeutigen Zielpfad, der den relativen Pfad zum Quellordner enthält
+                    rel_path = file.relative_to(folder)
+                    last_folder = Path(folder).name
+                    dest_path = out_dir / last_folder / file.name
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(file, dest_path)
+        logger.info(f"Copied files to {out_dir}")
+        return
 
     def _run_early_stop_check(self, score: float):
         should_stop = False
@@ -197,7 +246,7 @@ class Trainer:
         # Each run will have a unique source code, config, and log file.
         time_now = self._get_time_now()
         self.source_code_dir = Path(__file__).expanduser().absolute().parent.parent.parent
-        self.source_code_backup_dir = self.exp_dir / f"source_code__{time_now}"
+        self.source_code_backup_dir = self.exp_dir / "source_code" / f"source_code__{time_now}"
         self.config_path = self.exp_dir / f"config__{time_now}.toml"
 
     def _find_latest_ckpt_path(self):
@@ -286,6 +335,55 @@ class Trainer:
             return get_linear_schedule_with_warmup(
                 optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=max_steps
             )
+
+    def create_warmup_scheduler_pretraining(self, optimizer, scheduler_name, max_steps: int):
+        num_warmup_steps = self.get_warmup_steps(self.warmup_steps_enc, max_steps, self.warmup_ratio)
+        if scheduler_name == "constant_schedule_with_warmup":
+            return get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps)
+        elif scheduler_name == "linear_schedule_with_warmup":
+            return get_linear_schedule_with_warmup(
+                optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=max_steps
+            )
+
+    def create_warmup_scheduler_offset(self, optimizer, scheduler_name, max_steps, warumup_steps, step_offset=0):
+        num_warmup_steps = self.get_warmup_steps(warumup_steps, max_steps, self.warmup_ratio)
+
+        def lr_lambda(current_step):
+            adjusted_step = current_step - step_offset
+            if adjusted_step < 0:
+                return 0.0
+            elif adjusted_step < num_warmup_steps:
+                return float(adjusted_step) / float(max(1, num_warmup_steps))
+            return 1.0 #  max(0.0, float(max_steps - current_step) / float(max(1, max_steps - num_warmup_steps)))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    def create_schedulers_pretraining(self, max_steps: int, max_steps_preheat, step_offset):
+        """Create schedulers.
+
+        You can override this method to create your own schedulers. For example, in GAN training, you may want to
+        create two schedulers for the generator and the discriminator.
+
+        Args:
+            max_steps: the maximum number of steps to train.
+        """
+        self.lr_scheduler_small = self.create_warmup_scheduler(
+            optimizer=self.optimizer_small, scheduler_name=self.scheduler_name, max_steps=max_steps
+        )
+        self.lr_scheduler_big = self.create_warmup_scheduler_offset(
+            optimizer=self.optimizer_big, scheduler_name=self.scheduler_name, warumup_steps=self.warmup_steps, max_steps=max_steps, step_offset=step_offset)
+        # self.lr_scheduler_big = self.create_warmup_scheduler(
+        #     optimizer=self.optimizer_big, scheduler_name=self.scheduler_name, max_steps=max_steps
+        # )
+        self.lr_scheduler_big_pretrain = self.create_warmup_scheduler_offset(
+            optimizer=self.optimizer_big, scheduler_name=self.scheduler_name, warumup_steps=self.warmup_steps_enc, max_steps=max_steps_preheat, step_offset=0)
+        # self.lr_scheduler_big_pretrain = self.create_warmup_scheduler_pretraining(
+        #     optimizer=self.optimizer_big, scheduler_name=self.scheduler_name, max_steps=max_steps
+        # )
+        # todo: encoder_warmup_steps, warm up steps setzen, prepare machen , und in loop passend wählen
+        self.lr_scheduler_small, self.lr_scheduler_big, self.lr_scheduler_big_pretrain = self.accelerator.prepare(self.lr_scheduler_small,
+                                                                                  self.lr_scheduler_big, self.lr_scheduler_big_pretrain)
+
 
     def create_schedulers(self, max_steps: int):
         """Create schedulers.
@@ -376,6 +474,20 @@ class Trainer:
 
         return bar_desc
 
+    def freeze_all_except_encoder(self):
+        # Falls DDP benutzt wird, greife auf das Originalmodell zu
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+
+        for p in model_ref.parameters():
+            p.requires_grad = False
+        for p in model_ref.gcc_encoder.parameters():
+            p.requires_grad = True
+
+    def unfreeze_all(self):
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        for p in model_ref.parameters():
+            p.requires_grad = True
+
     def train(self, train_dataloader: DataLoader, validation_dataloader):
         """Train loop entry point.
 
@@ -405,6 +517,8 @@ class Trainer:
 
         # Setting up training control variables
         steps_per_epoch = len(train_dataloader)
+        # steps_per_epoch = int(train_dataloader.dataset.get_my_length / train_dataloader.batch_size +1) # for sharded dataloader
+        # print("STEPS PER EPOCH:", steps_per_epoch, flush=True)
         update_steps_per_epoch = steps_per_epoch // self.gradient_accumulation_steps
         update_steps_per_epoch = max(update_steps_per_epoch, 1)
 
@@ -424,7 +538,13 @@ class Trainer:
 
         # Generator learning rate scheduler
         if self.warmup_steps > 0:
-            self.create_schedulers(max_steps=max_steps)
+            if self.preheat_epochs==0:
+                self.create_schedulers(max_steps=max_steps)
+            else:
+                step_offset = self.preheat_epochs * steps_per_epoch
+                self.create_schedulers_pretraining(max_steps=max_steps, max_steps_preheat=step_offset, step_offset=step_offset)
+
+
         if self.use_one_cycle_lr:
             self.create_lr_one_cycle_scheduler(max_steps=max_steps * self.accelerator.num_processes)
 
@@ -437,23 +557,54 @@ class Trainer:
             with torch.no_grad():
                 logger.info("Validation on ZERO epoch...")
                 score = self.validate(validation_dataloader)
+                # score = self.validate(train_dataloader)
+                # print("VALIDATION DONE", self.accelerator.process_index, flush=True)
+
             if self.accelerator.is_local_main_process:
                 self._save_checkpoint(epoch=0, is_best_epoch=False)
 
         for epoch in range(self.state.epochs_trained + 1, max_epochs + 1):
+            # print(f"epoch {epoch}",self.accelerator.process_index, flush=True)
             logger.info(f"{'=' * 9} Epoch {epoch} out of {max_epochs} {'=' * 9}")
             logger.info("Begin training...")
 
+            self.num_correct = 0
+            self.num_total = 0
+
+            self.num_correct_ov = 0
+            self.num_total_ov = 0
+
             self.set_models_to_train_mode()
+
+            if self.unwrap_model.wavlm_frozen:
+                self.unwrap_model.wavlm.eval()
+
             if self.freeze_wavlm:
                 self.unwrap_model.wavlm_model.eval()
+            if epoch <= self.preheat_epochs:
+                logger.info(">> Pretraining encoder only")
+                self.freeze_all_except_encoder()
+            else:
+                logger.info(">> Full model training")
+                self.unfreeze_all()
 
             training_epoch_output = []
+            # print(f"waiting for all",self.accelerator.process_index, flush=True)
+            # self.accelerator.wait_for_everyone()
+            # print("all here", self.accelerator.process_index, flush=True)
 
-            # the iter number of progress bar increments by 1 by default whether gradient accumulation is used or not.
-            # but we update the description of the progress bar only when the gradients are synchronized across all processes.
+            # # the iter number of progress bar increments by 1 by default whether gradient accumulation is used or not.
+            # # but we update the description of the progress bar only when the gradients are synchronized across all processes.
+            # # train_dataloader.__len__ = update_steps_per_epoch
+            # # gather len von sharded dataloaders
+            # print("lens simple:", len(train_dataloader), flush=True)
+            # lens = self.accelerator.gather(torch.tensor(len(train_dataloader), device=self.device))
+            # lengths_list = lens.cpu().tolist()  # Liste mit Längen pro Prozess
+            # print("Lengths list:", lengths_list, flush=True)
+
             dataloader_bar = tqdm(
                 train_dataloader,
+                total=update_steps_per_epoch,
                 desc="",
                 dynamic_ncols=True,
                 bar_format="{l_bar}{r_bar}",
@@ -462,8 +613,40 @@ class Trainer:
                 position=0,
                 leave=True,
             )
-
+            # import time
+            self.id_list = []
             for batch_idx, batch in enumerate(dataloader_bar):
+                # print(f"Training batch {batch_idx}", self.accelerator.process_index, flush=True)
+                # print(f"Batch {batch_idx} IDs:", batch['ids'], flush=True)
+                self.id_list.extend(batch['ids'])
+
+                # print("LISTE:", self.id_list, "\n SET:", set(self.id_list), flush=True)
+                # print("LISTE:", len(self.id_list), "SET:", len(set(self.id_list)), flush=True)
+                for k, v in batch.items():
+                    if torch.is_tensor(v) and v.device != self.accelerator.device:
+                        batch[k] = v.to(self.accelerator.device)
+                # if batch_idx == 0:
+                #     print("DATALOADER SHARDED:", train_dataloader.__class__)
+                # if self.debug:
+                #     # CUDA warmup
+                #     for _ in range(5):
+                #         _ = self.training_step(batch, batch_idx)
+                #
+                #     torch.cuda.synchronize()
+                #     start = time.time()
+                #
+                #     for _ in range(6):  # 10 Iterationen mitteln
+                #         out = self.training_step(batch, batch_idx)
+                #         torch.cuda.synchronize()
+                #     end = time.time()
+                #     print(f"Average iteration time: {(end - start) / 6:.4f} sec")
+                #     if batch_idx >= 5:
+                #         assert False
+                #     continue
+
+                # t0 = time.time()
+                # data_loading_time = t0 - start if batch_idx > 0 else 0
+                # t1 = time.time()
                 # accumulate() will automatically skip synchronization if applicable loss is linearly scaled with the optimizer.grad
                 # accumulate() will automatically divide the loss in backward by the number of gradient accumulation steps
                 # However, it won't return this loss, so we need to manually divide the loss by the number of gradient accumulation steps.
@@ -471,18 +654,46 @@ class Trainer:
                     # You are responsible for calling `.backward()`, `.step()`, and `.zero_grad()` in your implementation
                     loss_dict = self.training_step(batch, batch_idx)
                     training_epoch_output.append(loss_dict)
-
+                    # forward_time = time.time() - t1
                     if not self.accelerator.optimizer_step_was_skipped:
                         if self.warmup_steps > 0:
-                            self.lr_scheduler_step()
+
+                            if self.state.epochs_trained < self.preheat_epochs:
+                                # logger.info(">> Preheating encoder only, LEARNING RATE PREHEAT")
+                                self.lr_scheduler_small.step(self.state.steps_trained)
+                                self.lr_scheduler_big_pretrain.step(self.state.steps_trained)
+                            else:
+                                # logger.info(">> WARMUP full model, learning rate should go up over 3000 steps")
+                                self.lr_scheduler_small.step(self.state.steps_trained)
+                                self.lr_scheduler_big.step(self.state.steps_trained)
 
                         if self.use_one_cycle_lr:
-                            self.lr_one_cycle_scheduler_small.step() 
-                            self.lr_one_cycle_scheduler_big.step() 
+                            self.lr_one_cycle_scheduler_small.step()
+                            self.lr_one_cycle_scheduler_big.step()
+                    if batch_idx % 300 == 0 and batch_idx != 0:
+                        self.accuracy = self.num_correct / self.num_total if self.num_total > 0 else 0.0
+                        self.accuracy_ov = self.num_correct_ov / self.num_total_ov if self.num_total_ov > 0 else 0.0
+                        self.training_epoch_end(training_epoch_output, stepwise=True)
 
                 self.state.steps_trained += 1
+
+                # print(f"Batch {batch_idx}: DataLoad {data_loading_time:.3f}s | Forward {forward_time:.3f}s")
+                # start = time.time()
+
+            # print("LISTE:", sorted(self.id_list), "\n SET:", sorted(set(self.id_list)), flush=True)
+            print("LISTE:", len(self.id_list), "SET:", len(set(self.id_list)), flush=True)
+
+            # duplicates = [id for id in self.id_list if self.id_list.count(id) > 1]
+            # unique_duplicates = sorted(duplicates)
+            # print("DUPLICATES:", unique_duplicates, "COUNT:", len(unique_duplicates), flush=True)
+
             self.state.epochs_trained += 1
+            self.accuracy = self.num_correct / self.num_total if self.num_total > 0 else 0.0
+            print(f"Accuracy: {self.accuracy:.4f}")
+            self.accuracy_ov = self.num_correct_ov / self.num_total_ov if self.num_total_ov > 0 else 0.0
+            print(f"Accuracy: {self.accuracy_ov:.4f}")
             self.training_epoch_end(training_epoch_output)
+
 
             # Should save, evaluate, and early stop?
             if self.accelerator.is_local_main_process and epoch % self.save_ckpt_interval == 0:
@@ -491,6 +702,12 @@ class Trainer:
             if epoch % self.validation_interval == 0:
                 with torch.no_grad():
                     logger.info("Training finished, begin validation...")
+
+                    self.num_correct = 0
+                    self.num_total = 0
+                    self.num_correct_ov = 0
+                    self.num_total_ov = 0
+
                     score = self.validate(validation_dataloader)
 
                     if self.accelerator.is_local_main_process:
@@ -531,19 +748,41 @@ class Trainer:
         self.set_models_to_eval_mode()
 
         validation_output = []
+        import time
+        self.all_preds = []
+        self.all_targets = []
+        # steps_per_epoch = int(len(dataloader.dataset) / dataloader.batch_size +1) # for sharded dataloader
+        # print(f"rank {self.accelerator.process_index}:", steps_per_epoch)
+        steps_per_epoch = int(len(dataloader)) # for sharded dataloader
+        # print(f"rank {self.accelerator.process_index}:", steps_per_epoch)
+        end = None
+        # print(f"num batches for rank {self.accelerator.process_index}:", len(dataloader), flush=True)
+        # TODO : einfach mal drüber iterieren und gucken wann die iteratoren leer sind, len() z#ählt nämlich nicht!!!
         for batch_idx, batch in enumerate(
             tqdm(
                 dataloader,
+                total=steps_per_epoch,
                 desc="",
                 bar_format="{l_bar}{r_bar}",
                 dynamic_ncols=True,
                 disable=not self.accelerator.is_local_main_process,
             )
         ):
+            # print(f"Validating batch {batch_idx}", self.accelerator.process_index, time.time()-start, flush=True)
+            # continue
+            for k, v in batch.items():
+                if torch.is_tensor(v) and v.device != self.accelerator.device:
+                    batch[k] = v.to(self.accelerator.device)
             # We recommend you directly calculate the metric score in the validation_step function and return the
             # metric score in the validation_step function, and then calculate the mean of the metric score
             # in the validation_epoch_end function.
+            # if end is not None:
+            #     print(f"Validation time: {end -start:.3f} sec", flush=True)
+            # start = time.time()
+            # if end is not None:
+            #     print(f"Data loading time: {start - end:.3f} sec", flush=True)
             step_output = self.validation_step(batch, batch_idx)
+            mid = time.time()
 
             """
             {
@@ -552,17 +791,72 @@ class Trainer:
                 ...
             }
             """
-            gathered_step_output = self.accelerator.gather_for_metrics(step_output)
+            step_output_cpu = {}
+            step_output_device = {}
+
+            for k, v in step_output.items():
+                if torch.is_tensor(v):
+                    step_output_cpu[k] = v.cpu().item()  # CPU + float für gather_object
+                    step_output_device[k] = v.to(self.accelerator.device)  # GPU/Device Tensor
+                else:
+                    step_output_cpu[k] = v  # Float bleibt Float
+                    step_output_device[k] = torch.tensor(v, device=self.accelerator.device, dtype=torch.float)
+
+            # print(step_output_cpu.items())
+            gathered_step_output = self.accelerator.gather_for_metrics(step_output_device)#, use_gather_object=True)
+            # gathered_step_output = self.accelerator.gather(step_output_device)  # , use_gather_object=True)
+
+            # print(type(gathered_step_output))
+            # print(gathered_step_output)
             validation_output.append(gathered_step_output)
+            end = time.time()
+
+            # step_output_device = {
+            #     k: (v.to(self.accelerator.device).contiguous() if torch.is_tensor(v) else v)
+            #     for k, v in step_output.items()
+            # }
+            # gathered_step_output = self.accelerator.gather_for_metrics(step_output_device)
+            # validation_output.append(gathered_step_output)
+
+            # gathered_step_output = self.accelerator.gather_for_metrics(step_output)
+            # validation_output.append(gathered_step_output)
+
+
+            # break
+
 
         logger.info("Validation inference finished, begin validation epoch end...")
 
+        if hasattr(self, "num_total"):
+            self.accuracy = self.num_correct / self.num_total if self.num_total > 0 else 0.0
+            self.accuracy_ov = self.num_correct_ov / self.num_total_ov if self.num_total_ov > 0 else 0.0
+            print(f"Accuracy: {self.accuracy:.4f}")
+        if len(self.all_preds) > 0:
+            self.ex_pred = self.all_preds[0][8:12].cpu().numpy()
+            self.ex_target = self.all_targets[0][8:12].cpu().numpy()
+
+            self.all_preds = torch.cat(self.all_preds).numpy().reshape(-1)
+            self.all_targets = torch.cat(self.all_targets).numpy().reshape(-1)
+            self.num_classes = max(self.all_targets.max(), self.all_preds.max()) + 1
+            self.cm = confusion_matrix(self.all_targets, self.all_preds, labels=list(range(self.num_classes)))
+
+        # print(f"Example predictions: {self.accelerator.process_index}")
+        self.accelerator.wait_for_everyone()
+        # torch.distributed.barrier()
+        # print(f"waited in validate: {self.accelerator.process_index}")
+
+        # assert False
+        # TODO: prefetch race?? hmm sund auf jeden fall ungleich lang nach test durch iterieren
+        # TODO: mal ohne metriken probieren, zeiten printen
         if self.accelerator.is_local_main_process:
             # only the main process will run validation_epoch_end
             score = self.validation_epoch_end(validation_output)
-            return score
         else:
-            return None
+            score =  None
+
+        # torch.distributed.barrier()
+        # print(f"SCORE BERECHNET: {self.accelerator.process_index}")
+        return score
 
     def _check_improvement(self, score, save_max_score=True):
         """Check if the current model got the best metric score"""
@@ -617,7 +911,7 @@ class Trainer:
         """
         raise NotImplementedError
 
-    def training_epoch_end(self, training_epoch_output):
+    def training_epoch_end(self, training_epoch_output, stepwise=False):
         """Implement the logic of the end of a training epoch. Please override this function if you want to do something.
 
         When the training epoch ends, this function will be called. The input is a list of the loss dict of each step
@@ -652,10 +946,18 @@ class Trainer:
             loss_mean = torch.mean(torch.tensor(loss_items))
 
             if self.accelerator.is_local_main_process:
-                logger.info(f"Training Loss '{key}' on epoch {self.state.epochs_trained}: {loss_mean}")
-                self.writer.add_scalar(f"Train_Epoch/{key}", loss_mean, self.state.epochs_trained)
-                self.writer.add_scalar(f"Train_Epoch/lr_small", get_rate(self.optimizer_small), self.state.epochs_trained)
-                self.writer.add_scalar(f"Train_Epoch/lr_big", get_rate(self.optimizer_big), self.state.epochs_trained)
+                if stepwise:
+                    logger.info(f"Training Loss '{key}' on Train_Step {self.state.steps_trained}: {loss_mean}")
+                    self.writer.add_scalar(f"Train_Step/{key}", loss_mean, self.state.steps_trained)
+                    self.writer.add_scalar(f"Train_Step/accuracy", self.accuracy, self.state.steps_trained)
+                    self.writer.add_scalar(f"Train_Step/accuracy_OV", self.accuracy_ov, self.state.steps_trained)
+                else:
+                    logger.info(f"Training Loss '{key}' on epoch {self.state.epochs_trained}: {loss_mean}")
+                    self.writer.add_scalar(f"Train_Epoch/{key}", loss_mean, self.state.epochs_trained)
+                    self.writer.add_scalar(f"Train_Epoch/accuracy", self.accuracy, self.state.epochs_trained)
+                    self.writer.add_scalar(f"Train_Epoch/accuracy_OV", self.accuracy_ov, self.state.epochs_trained)
+                    self.writer.add_scalar(f"Train_Epoch/lr_small", get_rate(self.optimizer_small), self.state.epochs_trained)
+                    self.writer.add_scalar(f"Train_Epoch/lr_big", get_rate(self.optimizer_big), self.state.epochs_trained)
 
     def validation_step(self, batch, batch_idx):
         """Implement a validation step for validating a model on all processes.

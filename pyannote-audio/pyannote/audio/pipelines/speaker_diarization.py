@@ -145,6 +145,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         self.device = device
 
         segmentation_duration = seg_duration if seg_duration is not None else model.specifications.duration
+
         self._segmentation = Inference(
             model,
             duration=segmentation_duration,
@@ -204,7 +205,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
     def CACHED_SEGMENTATION(self):
         return "training_cache/segmentation"
 
-    def get_segmentations(self, file, hook=None, soft=False) -> SlidingWindowFeature:
+    def get_segmentations(self, file, path, hook=None, soft=False, out_dir=None) -> SlidingWindowFeature:
         """Apply segmentation model
 
         Parameter
@@ -220,7 +221,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         if hook is not None:
             hook = functools.partial(hook, "segmentation", None)
 
-        segmentations: SlidingWindowFeature = self._segmentation(file, hook=hook, soft=soft)
+        segmentations: SlidingWindowFeature = self._segmentation(file, path, hook=hook, soft=soft, out_dir=out_dir)
         return segmentations
 
     def get_embeddings(

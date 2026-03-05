@@ -27,7 +27,7 @@ validation_interval = 1
 freeze_wavlm = false
 lr_decay = false
 use_one_cycle_lr = false
-validation_before_training = false # true       # activate validation activate validation activate validation activate validation
+validation_before_training = true # true       # activate validation activate validation activate validation activate validation
 preheat_epochs = 0
 
 [optimizer_small]
@@ -87,7 +87,7 @@ batch_size = 16
 num_workers = 1
 drop_last = true
 pin_memory = true
-prefetch_factor = 5
+prefetch_factor = 20
 
 [validate_dataset]
 path = "dataset.DiarizationDataset"
@@ -109,4 +109,4 @@ batch_size = 16
 num_workers = 1
 drop_last = true
 pin_memory = true
-prefetch_factor = 5
+prefetch_factor = 20
