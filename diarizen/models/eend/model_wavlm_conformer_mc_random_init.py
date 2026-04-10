@@ -6,27 +6,34 @@
 
 
 import os
+from functools import lru_cache
 
+import dlp_mpi
 import numpy as np
+import paderbox as pb
 import torch
 import torch.nn as nn
 import torch.profiler
-from functools import lru_cache
-import paderbox as pb
-import dlp_mpi
-
 from pyannote.audio.core.model import Model as BaseModel
 from pyannote.audio.utils.receptive_field import (
-    multi_conv_num_frames, 
-    multi_conv_receptive_field_size, 
-    multi_conv_receptive_field_center
+    multi_conv_num_frames,
+    multi_conv_receptive_field_center,
+    multi_conv_receptive_field_size,
 )
 
-from diarizen.models.module.conformer import ConformerEncoder, gcc_encoder, init_as_identity
+from diarizen.models.module.conformer import (
+    ConformerEncoder,
+    gcc_encoder,
+    init_as_identity,
+)
 from diarizen.models.module.wav2vec2.model import wav2vec2_model as wavlm_model
 from diarizen.models.module.wavlm_config import get_config
-from diarizen.spatial_features.gcc_phat import (get_gcc_for_all_channel_pairs, channel_wise_activities,
-                                                convert_to_frame_wise_activities, get_dominant_time_frequency_mask)
+from diarizen.spatial_features.gcc_phat import (
+    channel_wise_activities,
+    convert_to_frame_wise_activities,
+    get_dominant_time_frequency_mask,
+    get_gcc_for_all_channel_pairs,
+)
 
 
 class Model(BaseModel):
@@ -54,21 +61,21 @@ class Model(BaseModel):
         selected_channel: int = 0,
         sample_rate: int = 16000,
         multichannel_processing=False,
-        random_channel = False,
+        random_channel=False,
     ):
         super().__init__(
             num_channels=num_channels,
             duration=chunk_size,
-            max_speakers_per_chunk=max_speakers_per_chunk
+            max_speakers_per_chunk=max_speakers_per_chunk,
         )
-        
+
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
         self.selected_channel = selected_channel
         self.random_channel = random_channel
-        self.multichannel_processing=multichannel_processing
+        self.multichannel_processing = multichannel_processing
 
-        # wavlm 
+        # wavlm
         self.wavlm_model = self.load_wavlm(wavlm_src)
         self.weight_sum = nn.Linear(wavlm_layer_num, 1, bias=False)
 
@@ -83,7 +90,7 @@ class Model(BaseModel):
             kernel_size=kernel_size,
             dropout=dropout,
             use_posi=use_posi,
-            output_activate_function=output_activate_function
+            output_activate_function=output_activate_function,
         )
         self.gcc_encoder = gcc_encoder(
             attention_in_aux=attention_in_aux,  # search range for delay
@@ -92,12 +99,12 @@ class Model(BaseModel):
             num_head_aux=num_head_aux,
             num_layer_aux=num_layer_aux,
             dropout=dropout,
-            )
+        )
 
         # self.norm_wavLM = nn.LayerNorm(attention_in)
         # self.norm_gcc = nn.LayerNorm(attention_in_aux)
 
-        self.merged_linear = nn.Linear(attention_in+attention_in_aux, attention_in)
+        self.merged_linear = nn.Linear(attention_in + attention_in_aux, attention_in)
 
         # self.proj_gcc = nn.Linear(attention_in_aux, attention_in)
 
@@ -208,11 +215,10 @@ class Model(BaseModel):
             padding=padding,
             dilation=dilation,
         )
-    
+
     @property
-    def get_rf_info(self):     
-        """Return receptive field info to dataset
-        """
+    def get_rf_info(self):
+        """Return receptive field info to dataset"""
 
         receptive_field_size = self.receptive_field_size(num_frames=1)
         receptive_field_step = (
@@ -220,7 +226,7 @@ class Model(BaseModel):
         )
         num_frames = self.num_frames(self.chunk_size * self.sample_rate)
         duration = receptive_field_size / self.sample_rate
-        step=receptive_field_step / self.sample_rate
+        step = receptive_field_step / self.sample_rate
         return num_frames, duration, step
 
     def load_wavlm(self, source: str):
@@ -230,7 +236,7 @@ class Model(BaseModel):
         Parameters
         ----------
         source : str
-            - If `source` is a config name (e.g., "wavlm_large_md_s80"), 
+            - If `source` is a config name (e.g., "wavlm_large_md_s80"),
             the model will be initialized using predefined configuration via `get_config()`.
             - If `source` is a file path (e.g., "pytorch_model.bin", "model.ckpt", or any local .pt file),
             the model will be loaded from the checkpoint, using its saved 'config' and 'state_dict'.
@@ -248,7 +254,7 @@ class Model(BaseModel):
                 raise ValueError("Checkpoint must contain 'config' and 'state_dict'.")
 
             for k, v in ckpt["config"].items():
-                if 'prune' in k and v is not False:
+                if "prune" in k and v is not False:
                     raise ValueError(f"Pruning must be disabled. Found: {k}={v}")
 
             model = wavlm_model(**ckpt["config"])
@@ -261,7 +267,6 @@ class Model(BaseModel):
 
         return model
 
-
     def wav2wavlm(self, in_wav, model):
         """
         transform wav to wavlm features
@@ -269,26 +274,41 @@ class Model(BaseModel):
         layer_reps, _ = model.extract_features(in_wav)
         return torch.stack(layer_reps, dim=-1)
 
-    def compute_gcc(self, waveforms_mc, frame_size_gcc=400, frame_shift_gcc=320, avg_len_gcc=4,
-                    search_range_gcc=10, f_max_gcc=3500, f_min=125, ths=[]):
+    def compute_gcc(
+        self,
+        waveforms_mc,
+        frame_size_gcc=400,
+        frame_shift_gcc=320,
+        avg_len_gcc=4,
+        search_range_gcc=10,
+        f_max_gcc=3500,
+        f_min=125,
+        ths=[],
+    ):
         """
         Compute GCC features from multichannel waveforms.
         returns:
             batch_gcc_features: (batch, frame, channel, channel, search_range)
         """
         batch_gcc_features = []
-        for sigs in waveforms_mc:   # dlp_mpi.split_managed(waveforms_mc):
+        for sigs in waveforms_mc:  # dlp_mpi.split_managed(waveforms_mc):
             # TODO: try different stft values for better gcc but need fit frames of WAVLM
-            sigs_stft = pb.transform.stft(sigs, frame_size_gcc, frame_shift_gcc,
-                                          pad=False, fading=False)
+            sigs_stft = pb.transform.stft(
+                sigs, frame_size_gcc, frame_shift_gcc, pad=False, fading=False
+            )
             voice_activity = channel_wise_activities(sigs, ths=ths)
             frame_wise_voice_activity = convert_to_frame_wise_activities(
                 voice_activity, frame_size=frame_size_gcc, frame_shift=frame_shift_gcc
             )
             dominant = get_dominant_time_frequency_mask(sigs_stft)
             gcc_features = get_gcc_for_all_channel_pairs(
-                sigs_stft, frame_wise_voice_activity, dominant=dominant, search_range=search_range_gcc, f_min=f_min,
-                f_max=f_max_gcc, avg_len=avg_len_gcc
+                sigs_stft,
+                frame_wise_voice_activity,
+                dominant=dominant,
+                search_range=search_range_gcc,
+                f_min=f_min,
+                f_max=f_max_gcc,
+                avg_len=avg_len_gcc,
             )
             # # os makedir data/gccs if not exists
             # path = store_gcc(gcc_features,)
@@ -299,7 +319,6 @@ class Model(BaseModel):
             batch_gcc_features.append(gcc_features)
         # return torch.from_numpy(np.array(batch_gcc_features))
         return np.array(batch_gcc_features)
-
 
     def forward(self, waveforms: torch.Tensor, gcc_features=None) -> torch.Tensor:
         """Pass forward
@@ -314,7 +333,7 @@ class Model(BaseModel):
         scores : (batch, frame, classes)
         """
 
-        assert waveforms.dim() == 3 # e.g. torch.Size([16, 8, 128000])
+        assert waveforms.dim() == 3  # e.g. torch.Size([16, 8, 128000])
         # if self.multichannel_processing:
         # waveforms_mc = waveforms.clone()
         if self.random_channel:
@@ -346,13 +365,16 @@ class Model(BaseModel):
         # gcc_embeddings = self.norm_gcc(gcc_embeddings)
 
         # Concatenate wavlm and gcc embeddings and project to original shape
-        combined = torch.cat((outputs, gcc_embeddings), dim=-1)  # (batch, frames, attention_in + delays)
+        combined = torch.cat(
+            (outputs, gcc_embeddings), dim=-1
+        )  # (batch, frames, attention_in + delays)
         # First project into old shape with zeros on gcc and identiy on x to start from only x going into conformer and be able to load conformer weights.
-        outputs = self.merged_linear(combined)  # out shape is (batch, frames, attention_in)
-#         # # test: adding to break model
-#         # gcc_embeddings = self.proj_gcc(gcc_embeddings)
-#         # outputs = outputs + gcc_embeddings
-
+        outputs = self.merged_linear(
+            combined
+        )  # out shape is (batch, frames, attention_in)
+        #         # # test: adding to break model
+        #         # gcc_embeddings = self.proj_gcc(gcc_embeddings)
+        #         # outputs = outputs + gcc_embeddings
 
         outputs = self.conformer(outputs)
 
@@ -365,10 +387,11 @@ class Model(BaseModel):
 
         return outputs
 
-if __name__ == '__main__':
-    wavlm_conf_name = 'wavlm_base_md_s80'
+
+if __name__ == "__main__":
+    wavlm_conf_name = "wavlm_base_md_s80"
     model = Model(wavlm_conf_name=wavlm_conf_name)
     print(model)
     x = torch.randn(2, 1, 32000)
     y = model(x)
-    print(f'y: {y.shape}')
+    print(f"y: {y.shape}")

@@ -20,7 +20,7 @@ from diarizen.combine_act import solve_permutation
 from diarizen.trainer_dual_opt import Trainer as BaseTrainer
 from diarizen.scoring.der_ov import compute_der
 from torch import nn
-import time
+import h5py
 
 logger = get_logger(__name__)
 
@@ -223,9 +223,6 @@ class Trainer(BaseTrainer):
         # auto GN
         self.grad_history = []
 
-    import torch
-    import torch.nn as nn
-
     def guarded_ce_loss(self, logits, targets, ignore_index=None):
         """
         logits: (N, C, ...) raw scores
@@ -280,7 +277,119 @@ class Trainer(BaseTrainer):
         if len(self.grad_history) > self.gradient_history_size:
             self.grad_history.pop(0)
         clip_value = np.percentile(self.grad_history, self.gradient_percentile)
-        self.accelerator.clip_grad_norm_(model.parameters(), clip_value)  
+        self.accelerator.clip_grad_norm_(model.parameters(), clip_value)
+
+
+    def save_wavlm_features(self, wavlm_features, batch, dset):
+        """
+        Takes the wavlm representations from training and stores them as sequentially accessible hdf5 data on the disk
+        so that they can be easily read and used for training in future without the need to recompute the wavlm features every time.
+        Also the example id and target etc all needed for training are stored so that a complete and ready example can be loaded for training later on.
+
+        Args:
+            wavlm_features: tensor of shape (B, T, D) - WavLM representations
+            batch: dict containing 'ts' (targets), 'gccs', 'num_spks', and optionally 'ids'
+            save_path: str or Path - destination file path for HDF5 storage
+        """
+
+        save_path = Path(self.save_path) / dset
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Convert tensors to numpy
+        wavlm_features = torch.stack(wavlm_features, dim=1)  # B, Layers, T, D
+        features_np = wavlm_features.cpu().numpy().astype("float16")
+        targets_np = batch['ts'].cpu().numpy()
+        # gccs_np = batch['gccs'].cpu().numpy().astype("float16") if 'gccs' in batch else None
+        num_spks_np = batch['num_spks'].cpu().numpy().squeeze()
+        ids = batch['ids']
+
+        B, L, T, D = features_np.shape
+
+        with h5py.File(save_path, "a") as f:
+            #  create datasets if first time
+            if "wavlm_features" not in f:
+                f.create_dataset(
+                    "wavlm_features",
+                    shape=(0, L, T, D),
+                    maxshape=(None, L, T, D),
+                    chunks=(32, L, T, D),
+                    dtype="float16",
+                    compression="lzf"
+                )
+                f.create_dataset(
+                    "targets",
+                    shape=(0, T, targets_np.shape[2]),
+                    maxshape=(None, T, targets_np.shape[2]),
+                    chunks=(32, T, targets_np.shape[2]),
+                    dtype="float16",
+                    compression="lzf"
+                )
+                # f.create_dataset(
+                #     "gccs",
+                #     shape=(0, T, gccs_np.shape[2]),
+                #     maxshape=(None,T, gccs_np.shape[2]),
+                #     chunks=(32,T, gccs_np.shape[2]),
+                #     dtype="float16",
+                #     compression="lzf"
+                # )
+                f.create_dataset(
+                    "num_spks",
+                    shape=(0, num_spks_np.shape[1]),
+                    maxshape=(None, num_spks_np.shape[1]),
+                    chunks=(32, num_spks_np.shape[1]),
+                    dtype="int32"
+                )
+                dt = h5py.string_dtype(encoding="utf-8")
+                f.create_dataset(
+                    "ids",
+                    shape=(0,),
+                    maxshape=(None,),
+                    chunks=(32,),
+                    dtype=dt,
+                )
+
+            # append
+            n = f["wavlm_features"].shape[0]
+
+            f["wavlm_features"].resize(n + B, axis=0)
+            f["targets"].resize(n + B, axis=0)
+            f["num_spks"].resize(n + B, axis=0)
+            # f["gccs"].resize(n + B, axis=0)
+            f["ids"].resize(n + B, axis=0)
+
+
+            f["wavlm_features"][n:n + B] = features_np
+            f["targets"][n:n + B] = targets_np
+            f["num_spks"][n:n + B] = num_spks_np
+            # f["gccs"][n:n + B] = gccs_np.astype("float16")
+            f["ids"][n:n + B] = ids
+
+        # TODO: mapping idx und gccs mit 0en initialisieren wie in collate oder dataset lazy um loading aufwand nicht zu erhöhen
+
+        # TODO: ABER random access kann sehr langsam amchen, besser seuqentiell die daten aus dem hdf5 auslesen, damit nicht 32 verschiedene chunks geaden werden müssen!!
+        # TODO: kann ich also einfach die daten direkt aus dem ding auslesen? einfach die ersten 32 idx sind das erste batch etc? ist die reihenfolge quasi aus dem abspeicherungs vorlauf?
+        # todo: single worker debuggen etc?
+
+        # def __init__(self, path):
+        #     self.path = path
+        #     self.file = None
+        #     with h5py.File(path, "r") as f:
+        #         ids = f["ids"][:]
+        #
+        #     self.id_to_idx = {id_: i for i, id_ in enumerate(ids)}
+
+        # def __getitem__(self, idx):
+        #
+        #     if self.file is None:
+        #         self.file = h5py.File(self.path, "r")
+        #
+        #     idx = self.id_to_idx["sample_123"]
+        #     features = self.file["wavlm_features"][idx]
+        # f = self.file
+        #
+        # features = f["wavlm_features"][idx]
+        # targets = f["targets"][idx]
+        #     return self.file["wavlm_features"][idx]
 
     def training_step(self, batch, batch_idx):
         self.optimizer_small.zero_grad()
@@ -300,11 +409,16 @@ class Trainer(BaseTrainer):
         #         o += 1
         #
         # print("Overlap detected examples: ", o, " / ", len(target), o/len(target), flush=True)
+        if self.save_path is not None:
+            wavlm_features = self.model(xs, save_features=True)
+            self.save_wavlm_features(wavlm_features, batch, dset="train.h5")
 
         if self.num_spk:
             y_pred = self.model(xs, num_spk)
         elif self.num_spk_and_gcc:
             y_pred = self.model(gccs, num_spk)
+        elif self.spk_count_loss or self.only_waveforms:
+            y_pred = self.model(xs)
         else:
             y_pred = self.model(xs, gccs)
 
@@ -342,7 +456,8 @@ class Trainer(BaseTrainer):
                 target_spk_count = torch.clamp(target_spk_count, min=0, max=2)
                 spk_count_loss = nn.CrossEntropyLoss()(y_pred.view(-1, num_classes), target_spk_count.view(-1))
             else:
-                target_spk_count = torch.clamp(target_spk_count, min=0, max=self.model.module.max_num_spk-1)
+                max_num_spk = getattr(self.model, 'module', self.model).max_num_spk
+                target_spk_count = torch.clamp(target_spk_count, min=0, max=max_num_spk-1)
                 # target_spk_count = torch.clamp(target_spk_count, min=0, max=self.model.max_num_spk-1)
                 spk_count_loss = nn.CrossEntropyLoss()(y_pred.view(-1, num_classes), target_spk_count.view(-1))
             loss = spk_count_loss
@@ -396,7 +511,7 @@ class Trainer(BaseTrainer):
         return {"Loss": loss}
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        t1 = time.time()
+        # t1 = time.time()
         xs, target, gccs, num_spk = batch['xs'], batch['ts'], batch["gccs"], batch["num_spks"]
 
         # # debug:
@@ -413,14 +528,20 @@ class Trainer(BaseTrainer):
 
         sil_all_target = torch.zeros_like(target)
 
+        if self.save_path is not None:
+            wavlm_features = self.model(xs, save_features=True)
+            self.save_wavlm_features(wavlm_features, batch, dset="dev.h5")
+
         if self.num_spk:
             y_pred = self.model(xs, num_spk)
         elif self.num_spk_and_gcc:
             y_pred = self.model(gccs, num_spk)
+        elif self.spk_count_loss or self.only_waveforms:
+            y_pred = self.model(xs)
         else:
             y_pred = self.model(xs, gccs)
 
-        t2 = time.time()
+        # t2 = time.time()
         if not self.spk_count_loss:
             if self.bce_loss:
                 loss, perm = pit_bce_loss(y_pred, target)
@@ -440,77 +561,89 @@ class Trainer(BaseTrainer):
                 multilabel = self.unwrap_model.powerset.to_multilabel(y_pred)
                 permutated_target, _ = permutate(multilabel, target)
                 permutated_target_powerset = self.unwrap_model.powerset.to_powerset(
-                    permutated_target.float()
+                    permutated_target.float
                 )
                 loss = nll_loss(y_pred,
                                 torch.argmax(permutated_target_powerset, dim=-1)
                                 )
                 target_spk_count = torch.sum(target, dim=-1)  # sum over classes
         else:
+            # multilabel: Just for simpicity, shouldnt be used
+            # multilabel = self.unwrap_model.powerset.to_multilabel(y_pred)
+            if hasattr(self.unwrap_model, "powerset") and self.unwrap_model.powerset is not None:
+                multilabel = self.unwrap_model.powerset.to_multilabel(y_pred)
+            else:
+                multilabel = torch.zeros_like(target, dtype=y_pred.dtype, device=y_pred.device)
+            # spk counting loss
+
             # spk counting loss
             num_classes = y_pred.shape[-1]
             target_spk_count = torch.sum(target, dim=-1)  # sum over classes
-            # loss = self.guarded_ce_loss(y_pred.view(-1, num_classes), target_spk_count.view(-1), ignore_index=None)
-            freqs = {0: 0.073, 1: 0.71, 2: 0.17, 3: 0.04, 4: 0.007}
-            weights = torch.tensor([1.0 / freqs[c] for c in sorted(freqs)], dtype=torch.float32, device=y_pred.device)
-            weights = weights / weights.sum() * len(weights)
+            # # loss = self.guarded_ce_loss(y_pred.view(-1, num_classes), target_spk_count.view(-1), ignore_index=None)
+            # freqs = {0: 0.073, 1: 0.71, 2: 0.17, 3: 0.04, 4: 0.007}
+            # weights = torch.tensor([1.0 / freqs[c] for c in sorted(freqs)], dtype=torch.float32, device=y_pred.device)
+            # weights = weights / weights.sum() * len(weights)
 
-            if self.weighted_loss:
-                spk_count_loss = nn.CrossEntropyLoss(weight=weights)(y_pred.view(-1, num_classes), target_spk_count.view(-1))
-            elif self.focal_loss:
-                spk_count_loss = FocalLossMC(gamma=2.0, weight=weights)(y_pred.view(-1, num_classes), target_spk_count.view(-1))
-            elif self.ov_loss:
-                target_spk_count = torch.clamp(target_spk_count, min=0, max=2)
-                spk_count_loss = nn.CrossEntropyLoss()(y_pred.view(-1, num_classes), target_spk_count.view(-1))
-            else:
-                # print(y_pred.shape, target_spk_count.shape)
-                target_spk_count = torch.clamp(target_spk_count, min=0, max=self.model.module.max_num_spk-1)
-                # target_spk_count = torch.clamp(target_spk_count, min=0, max=self.model.max_num_spk-1)
-                spk_count_loss = nn.CrossEntropyLoss()(y_pred.view(-1, num_classes), target_spk_count.view(-1))
+            # if self.weighted_loss:
+            #     spk_count_loss = nn.CrossEntropyLoss(weight=weights)(y_pred.view(-1, num_classes), target_spk_count.view(-1))
+            # elif self.focal_loss:
+            #     spk_count_loss = FocalLossMC(gamma=2.0, weight=weights)(y_pred.view(-1, num_classes), target_spk_count.view(-1))
+            # elif self.ov_loss:
+            #     target_spk_count = torch.clamp(target_spk_count, min=0, max=2)
+            #     spk_count_loss = nn.CrossEntropyLoss()(y_pred.view(-1, num_classes), target_spk_count.view(-1))
+            # else:
+            #     # print(y_pred.shape, target_spk_count.shape)
+            max_num_spk = getattr(self.model, 'module', self.model).max_num_spk
+            target_spk_count = torch.clamp(target_spk_count, min=0, max=max_num_spk-1)
+            # target_spk_count = torch.clamp(target_spk_count, min=0, max=self.model.max_num_spk-1)
+            spk_count_loss = nn.CrossEntropyLoss()(y_pred.view(-1, num_classes), target_spk_count.view(-1))
+
             loss = spk_count_loss
 
-            # ### accuracy und confusion matrix
-            # # TODO multilabel für die 3 fälle oben einstellen
+            ### accuracy und confusion matrix
+            # TODO multilabel für die 3 fälle oben einstellen
             # pred_labels = torch.argmax(multilabel, dim=-1)
-            # # pred_labels = torch.argmax(y_pred, dim=-1)
-            # gt_labels = target_spk_count.squeeze()
-            # self.all_preds.append(pred_labels.cpu())
-            # self.all_targets.append(gt_labels.cpu())
-            #
-            # hits = (pred_labels == gt_labels).sum().item()
-            # total = pred_labels.numel()
-            # self.num_correct += hits
-            # self.num_total += total
-            #
-            # hits_ov = ((pred_labels == gt_labels) & (pred_labels >= 2)).sum().item()
-            # total_ov = (gt_labels >= 2).sum().item()
-            # self.num_correct_ov += hits_ov
-            # self.num_total_ov += total_ov
+            pred_labels = torch.argmax(y_pred, dim=-1)
+
+
+            gt_labels = target_spk_count.squeeze()  # (F) num spk per frame
+            self.all_preds.append(pred_labels.cpu())
+            self.all_targets.append(gt_labels.cpu())
+
+            hits = (pred_labels == gt_labels).sum().item()
+            total = pred_labels.numel()
+            self.num_correct += hits
+            self.num_total += total
+
+            hits_ov = ((pred_labels == gt_labels) & (gt_labels >= 2)).sum().item()
+            total_ov = (gt_labels >= 2).sum().item()
+            self.num_correct_ov += hits_ov
+            self.num_total_ov += total_ov
+
 
         ### accuracy und confusion matrix
-        pred_labels = torch.argmax(multilabel, dim=-1)
-        gt_labels = target_spk_count.squeeze()
-        self.all_preds.append(pred_labels.cpu())
-        self.all_targets.append(gt_labels.cpu())
+        # pred_labels = torch.argmax(multilabel, dim=-1)
+        # gt_labels = target_spk_count.squeeze()
+        # self.all_preds.append(pred_labels.cpu())
+        # self.all_targets.append(gt_labels.cpu())
 
-        t3 = time.time()
+        # t3 = time.time()
         val_metrics = self.unwrap_model.validation_metric(
             torch.transpose(multilabel, 1, 2),
             torch.transpose(target, 1, 2),
         )
         # print(val_metrics, flush=True)
-
         # store rttms and compute der ov
         # if self.accelerator.is_local_main_process:
-        t4 = time.time()
+        # t4 = time.time()
         if self.compute_second_der:
             rank = self.accelerator.process_index
             # das hier kostet Zeit
             der, miss, fa, conf, der_ov, der_s = get_der_ov(multilabel, target, rank, self.exp_dir)
             # print(f"DER: {der:.3f}, DER_ov: {der_ov:.3f}, DER_s: {der_s:.3f}, Miss: {miss:.3f}, FA: {fa:.3f}, Conf: {conf:.3f}", flush=True)
-        t5 = time.time()
+        # t5 = time.time()
 
-        if not torch.equal(target, sil_all_target):
+        if not torch.equal(target, sil_all_target) and hasattr(self.unwrap_model, "powerset"):
             val_DER = val_metrics['DiarizationErrorRate']
             val_DER_ov = val_metrics['OverlapDiarizationErrorRate']
             if self.compute_second_der:
@@ -526,12 +659,12 @@ class Trainer(BaseTrainer):
                 val_DER2 = torch.zeros_like(val_metrics['DiarizationErrorRate'], device=val_metrics['DiarizationErrorRate'].device)
                 val_DER_ov2 =  torch.zeros_like(val_metrics['DiarizationErrorRate'], device=val_metrics['DiarizationErrorRate'].device)
                 val_DER_s = torch.zeros_like(val_metrics['DiarizationErrorRate'], device=val_metrics['DiarizationErrorRate'].device)
-            val_DER_ov = torch.zeros_like(val_metrics['OverlapDiarizationErrorRate'], device=val_metrics['DiarizationErrorRate'].device)
+            val_DER_ov = torch.zeros_like(val_metrics['DiarizationErrorRate'], device=val_metrics['DiarizationErrorRate'].device)
             val_FA = torch.zeros_like(val_metrics['DiarizationErrorRate/FalseAlarm'], device=val_metrics['DiarizationErrorRate'].device)
             val_Miss = torch.zeros_like(val_metrics['DiarizationErrorRate/Miss'], device=val_metrics['DiarizationErrorRate'].device)
             val_Confusion = torch.zeros_like(val_metrics['DiarizationErrorRate/Confusion'], device=val_metrics['DiarizationErrorRate'].device)
 
-        t6 = time.time()
+        # t6 = time.time()
         # print(f"Validation step times: forward={t2-t1:.3f}s, Loss={t3-t2:.3f}s, DER={t4-t3:.3f}s, DER2= {t5-t4:.3f}s, Ende={t6-t5:.3f}s", flush=True)
         if self.compute_second_der:
             return {"Loss": loss, "DER": val_DER,  "val_DER2": val_DER2, "val_DER_ov2": val_DER_ov2, "val_DER_s": val_DER_s,  #"DER_ov": val_DER_ov,
@@ -552,29 +685,55 @@ class Trainer(BaseTrainer):
             if key == "val_DER_ov2":
                 DER_val_ov = metric_mean
             self.writer.add_scalar(f"Validation_Epoch/{key}", metric_mean, self.state.epochs_trained)
-        self.writer.add_scalar(f"Validation_Epoch/accuracy", self.accuracy, self.state.epochs_trained)
-        self.writer.add_scalar(f"Validation_Epoch/accuracy_OV", self.accuracy_ov, self.state.epochs_trained)
-        logger.info(f"Validation Loss/DER/DER_ov on epoch {self.state.epochs_trained}: {round(Loss_val.item(), 3)} / {round(DER_val.item(), 3)} / {round(DER_val_ov.item(), 3)}")
+        self.writer.add_scalar(f"Validation_metrics/accuracy", self.accuracy, self.state.epochs_trained)
+        self.writer.add_scalar(f"Validation_metrics/accuracy_OV", self.accuracy_ov, self.state.epochs_trained)
+        if len(self.all_preds) > 0:
+            summary_line = f"Validation Loss/DER/DER_ov/F1score on epoch {self.state.epochs_trained}: {round(Loss_val.item(), 3)} / {round(DER_val.item(), 3)} / {round(DER_val_ov.item(), 3)} / {round(self.f1_macro, 3)}"
+        else:
+            summary_line = f"Validation Loss/DER/DER_ov on epoch {self.state.epochs_trained}: {round(Loss_val.item(), 3)} / {round(DER_val.item(), 3)} / {round(DER_val_ov.item(), 3)}"
+        logger.info(summary_line)
+
+        with open(self.summary_path, "a") as f:
+            f.write(summary_line + "\n")
+
+        with open(self.summary_path_date, "a") as f:
+            f.write(summary_line + "\n")
 
         ### confusion matrix
-        fig = self.plot_cm()
-        self.writer.add_figure("Confusion Matrix/Validation", fig, global_step=self.state.epochs_trained)
-        plt.close(fig)
-        self.cm_normalized = self.cm.astype(np.float32) / self.cm.sum(axis=1, keepdims=True)
-        self.cm = np.nan_to_num(self.cm_normalized)  # for division by 0
-        fig = self.plot_cm(normalized=True)
-        self.writer.add_figure("Confusion Matrix/Validation_normalized", fig, global_step=self.state.epochs_trained)
-        plt.close(fig)
-
-
-        ### examples
-        figs = self. plot_predictions_for_examples()
-        for i, fig in enumerate(figs):
-            self.writer.add_figure(f"Examples/Validation_{i}", fig, global_step=self.state.epochs_trained)
+        if len(self.all_preds) > 0:
+            fig = self.plot_cm()
+            self.writer.add_figure("Confusion Matrix/Validation", fig, global_step=self.state.epochs_trained)
+            plt.close(fig)
+            self.cm_normalized = self.cm.astype(np.float32) / self.cm.sum(axis=1, keepdims=True)
+            self.cm = np.nan_to_num(self.cm_normalized)  # for division by 0
+            fig = self.plot_cm(normalized=True)
+            self.writer.add_figure("Confusion Matrix/Validation_normalized", fig, global_step=self.state.epochs_trained)
             plt.close(fig)
 
-        self.all_preds = []
-        self.all_targets = []
+            # F1 Scores
+            self.writer.add_scalar(f"Validation_metrics/F1_macro", self.f1_macro, self.state.epochs_trained)
+            self.writer.add_scalar(f"Validation_metrics/F1_weighted", self.f1_weighted, self.state.epochs_trained)
+            self.writer.add_scalar(f"Validation_metrics/precision_macro", self.precision_macro, self.state.epochs_trained)
+            self.writer.add_scalar(f"Validation_metrics/recall_macro", self.recall_macro, self.state.epochs_trained)
+            for i, (f1,re,pr) in enumerate(zip(self.f1_per_class, self.recall_per_class, self.precision_per_class)):
+                print(f"F1 score for class {i}: {f1:.3f}", flush=True)
+                self.writer.add_scalar(f"Validation_metrics/f1_class_{i}", f1, self.state.epochs_trained)
+                self.writer.add_scalar(f"Validation_metrics/recall_class_{i}", re, self.state.epochs_trained)
+                self.writer.add_scalar(f"Validation_metrics/precision_class_{i}", pr, self.state.epochs_trained)
+            # # Per-Class in einer Gruppe
+            # f1_per_class_dict = {f"class_{i}": score for i, score in enumerate(self.f1_per_class)}
+            # self.writer.add_scalars("Validation_metrics/F1_per_class", f1_per_class_dict, self.state.epochs_trained)
+
+
+
+            ### examples
+            figs = self. plot_predictions_for_examples()
+            for i, fig in enumerate(figs):
+                self.writer.add_figure(f"Examples/Validation_{i}", fig, global_step=self.state.epochs_trained)
+                plt.close(fig)
+
+            self.all_preds = []
+            self.all_targets = []
 
         # metric reset
         self.unwrap_model.validation_metric.reset()

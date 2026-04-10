@@ -248,7 +248,7 @@ class Model(BaseModel):
         layer_reps, _ = model.extract_features(in_wav)
         return torch.stack(layer_reps, dim=-1)
 
-    def forward(self, waveforms: torch.Tensor, gcc_features) -> torch.Tensor:
+    def forward(self, waveforms: torch.Tensor, gcc_features=None) -> torch.Tensor:
         """Pass forward
 
         Parameters

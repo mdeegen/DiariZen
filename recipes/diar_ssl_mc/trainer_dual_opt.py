@@ -1,12 +1,16 @@
 # Licensed under the MIT license.
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
 import os
+import torch.profiler
+import itertools
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 from pathlib import Path
 
-import torch
-import torch.profiler
-import numpy as np
-import seaborn as sns
+import paderbox as pb
 from accelerate.logging import get_logger
 from matplotlib import pyplot as plt
 
@@ -116,6 +120,8 @@ class Trainer(BaseTrainer):
                     y_pred = self.model(xs, num_spk)
             elif self.num_spk_and_gcc:
                 y_pred = self.model(gccs, num_spk)
+            elif self.spk_count_loss or self.only_waveforms:
+                y_pred = self.model(xs)
             else:
                 y_pred = self.model(xs, gccs)
 
@@ -182,6 +188,8 @@ class Trainer(BaseTrainer):
                 y_pred = self.model(xs, num_spk)
         elif self.num_spk_and_gcc:
             y_pred = self.model(gccs, num_spk)
+        elif self.spk_count_loss or self.only_waveforms:
+            y_pred = self.model(xs)
         else:
             y_pred = self.model(xs, gccs)
 
@@ -254,16 +262,12 @@ class Trainer(BaseTrainer):
         return {"Loss": loss, "DER": val_DER,  "val_DER2": val_DER2, "val_DER_ov2": val_DER_ov2, "val_DER_s": val_DER_s,  #"DER_ov": val_DER_ov,
                "FA": val_FA, "Miss": val_Miss, "Confusion": val_Confusion}
 
+
     def validation_epoch_end(self, validation_epoch_output):
         metric_keys = validation_epoch_output[0].keys()
         # Compute mean loss on all loss items on a epoch
         for key in metric_keys:
-
-            metric_items = [torch.mean(torch.as_tensor(step_out[key], dtype=torch.float32))
-                            for step_out in validation_epoch_output]
-            # metric_mean = torch.mean(torch.stack(metric_items))
-
-            # metric_items = [torch.mean(step_out[key]) for step_out in validation_epoch_output]
+            metric_items = [torch.mean(step_out[key]) for step_out in validation_epoch_output]
             metric_mean = torch.mean(torch.tensor(metric_items))
             if key == "Loss":
                 Loss_val = metric_mean
@@ -272,18 +276,17 @@ class Trainer(BaseTrainer):
             if key == "val_DER_ov2":
                 DER_val_ov = metric_mean
             self.writer.add_scalar(f"Validation_Epoch/{key}", metric_mean, self.state.epochs_trained)
-        logger.info(
-            f"Validation Loss/DER/DER_ov on epoch {self.state.epochs_trained}: {round(Loss_val.item(), 3)} / {round(DER_val.item(), 3)} / {round(DER_val_ov.item(), 3)}")
+        if len(self.all_preds) > 0:
+            summary_line = f"Validation Loss/DER/DER_ov/F1score on epoch {self.state.epochs_trained}: {round(Loss_val.item(), 3)} / {round(DER_val.item(), 3)} / {round(DER_val_ov.item(), 3)} / {round(self.f1_macro, 3)}"
+        else:
+            summary_line = f"Validation Loss/DER/DER_ov on epoch {self.state.epochs_trained}: {round(Loss_val.item(), 3)} / {round(DER_val.item(), 3)} / {round(DER_val_ov.item(), 3)}"
+        logger.info(summary_line)
 
-        # ### confusion matrix
-        # fig = self.plot_cm()
-        # self.writer.add_figure("Confusion Matrix/Validation", fig, global_step=self.state.epochs_trained)
-        # plt.close(fig)
-        # self.cm_normalized = self.cm.astype(np.float32) / self.cm.sum(axis=1, keepdims=True)
-        # self.cm = np.nan_to_num(self.cm_normalized)  # for division by 0
-        # fig = self.plot_cm(normalized=True)
-        # self.writer.add_figure("Confusion Matrix/Validation_normalized", fig, global_step=self.state.epochs_trained)
-        # plt.close(fig)
+        with open(self.summary_path, "a") as f:
+            f.write(summary_line + "\n")
+
+        with open(self.summary_path_date, "a") as f:
+            f.write(summary_line + "\n")
 
         self.all_preds = []
         self.all_targets = []

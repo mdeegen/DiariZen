@@ -49,17 +49,17 @@ def run(config, resume):
         load_wav = config["finetune"].get("load_wavlm_only", False)
         chkp_dir_clean_labels = config["finetune"].get("chkp_dir_clean_labels", None)
         load_der_encoder = config["finetune"].get("load_der_encoder", False)
-        dont_load_wavlm = config["finetune"].get("dont_load_wavlm", False)
+        # dont_load_wavlm = config["finetune"].get("dont_load_wavlm", False)
 
         if chkp_dir_clean_labels is not None:
             accelerator.print(f'Fine-tuning from a model trained with labels: {chkp_dir_clean_labels}')
             model = average_ckpt(chkp_dir_clean_labels, model, avg_ckpt_num=config["finetune"]["avg_ckpt_num"],
                                  load_wavlm_only=load_wav, load_encoder=load_encoder, load_spk_counting=config["finetune"]["load_spk_counting"],
-                                 load_der_encoder=load_der_encoder, dont_load_wavlm=dont_load_wavlm)
+                                 load_der_encoder=load_der_encoder, ) #dont_load_wavlm=dont_load_wavlm)
         else:
             model = average_ckpt(config["finetune"]["ckpt_dir"], model, avg_ckpt_num=config["finetune"]["avg_ckpt_num"],
                                  load_wavlm_only=load_wav, load_encoder=load_encoder, load_spk_counting=config["finetune"].get("load_spk_counting", None),
-                                 load_der_encoder=load_der_encoder, dont_load_wavlm=dont_load_wavlm)
+                                 load_der_encoder=load_der_encoder,) # dont_load_wavlm=dont_load_wavlm)
 
     # optimizer_small = instantiate(
     #     config["optimizer_small"]["path"],
@@ -102,23 +102,28 @@ def run(config, resume):
 
     collate_fn_partial = partial(
         _collate_fn,
-        acc = accelerator,
+        # acc = accelerator,
         max_speakers_per_chunk=config["model"]["args"]["max_speakers_per_chunk"],
-        noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
-        noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
+        # noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
+        # noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
         gcpsd=config["meta"].get("gcpsd", False),
+        only_waveform=config["train_dataset"]["args"].get("only_wav", False)
     )
     _collate_fn_non_lazy_partial = partial(
         _collate_fn_non_lazy,
         max_speakers_per_chunk=config["model"]["args"]["max_speakers_per_chunk"],
-        noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
-        noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
+        # noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
+        # noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
         gcpsd=config["meta"].get("gcpsd", False),
+        only_waveform=config["train_dataset"]["args"].get("only_wav", False)
     )
 
     # accelerator.state.use_distributed_sampler = False
     if "train" in args.mode:
         train_dataset_config["acc"] = accelerator
+        train_dataset_config["num_workers"] = config["train_dataset"]["dataloader"]["num_workers"]
+        train_dataset_config["batch_size"] = config["train_dataset"]["dataloader"].get("batch_size", 16),
+        train_dataset_config["gradient_accumulation_steps"] = config["trainer"]["args"]["gradient_accumulation_steps"]
         train_dataset = instantiate(config["train_dataset"]["path"], args=train_dataset_config).lazy
 
         # import itertools
@@ -166,6 +171,8 @@ def run(config, resume):
         # TODO: dev doch nicht lokal shufflen
         if "lazy" in config["validate_dataset"]["path"]:
             validate_dataset_config["acc"] = accelerator
+            validate_dataset_config["num_workers"] = config["validate_dataset"]["dataloader"]["num_workers"]
+            validate_dataset_config["batch_size"] = config["validate_dataset"]["dataloader"].get("batch_size", 16),
             validate_dataset = instantiate(config["validate_dataset"]["path"], args=validate_dataset_config).lazy
             # validate_dataset= validate_dataset[200*16:]
 

@@ -4,6 +4,7 @@
 
 import os
 from pathlib import Path
+import re
 
 import torch
 import torch.nn as nn
@@ -48,15 +49,31 @@ def load_metric_summary(metric_file, ckpt_path):
     out_lst = []
     for line in lines:
         assert "Validation Loss/DER" in line
-        epoch = line.split()[4].split(':')[0]
-        Loss, DER = line.split()[-3], line.split()[-1]
+        # epoch = line.split()[4].split(':')[0]
+        # Parses lines like: "Validation Loss/DER/DER_ov/F1score on epoch 5: 0.123 / 0.456 / 0.789 / 0.321"
+        # Also handles: "Validation Loss/DER on epoch 5: 0.123 / 0.456"
+        match = re.search(
+            r"on epoch\s+(\d+):\s*([\d.]+)\s*/\s*([\d.]+)"
+            r"(?:\s*/\s*([\d.]+))?(?:\s*/\s*([\d.]+))?",
+            line
+        )
+        assert match, f"Could not parse metric line: {line!r}"
+        epoch = match.group(1)
+        Loss = match.group(2)
+        DER = match.group(3)
+        DER_ov = float(match.group(4)) if match.group(4) is not None else 1e6
+        F1score = float(match.group(5)) if match.group(5) is not None else -1
+
         bin_path = f"epoch_{str(epoch).zfill(4)}/pytorch_model.bin"
         out_lst.append({
             'epoch': int(epoch),
             'bin_path': ckpt_path / bin_path,
             'Loss': float(Loss),
-            'DER': float(DER)
+            'DER': float(DER),
+            'DER_ov': DER_ov,
+            'F1score': F1score,
         })
+
     return out_lst
 
 def partly_load(module, prefix, ckpt):
@@ -81,7 +98,7 @@ def fix_keys(pretrained_state, old_prefix, new_prefix):
     return new_state
 
 def average_ckpt(ckpt_dir, model, val_metric='Loss', avg_ckpt_num=5, val_mode="best", load_wavlm_only=False,
-                 load_encoder=None, load_spk_counting=False, load_der_encoder=False, dont_load_wavlm=False):
+                 load_encoder=None, load_spk_counting=False, load_der_encoder=False, csd=False):
 
     # check if dir exists otherwise switch prefix to noctua2
     if not os.path.isdir(ckpt_dir):
@@ -89,28 +106,32 @@ def average_ckpt(ckpt_dir, model, val_metric='Loss', avg_ckpt_num=5, val_mode="b
         ckpt_dir = ckpt_dir.replace("/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc/exp/", "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc/exp/")
 
     if os.path.isfile(ckpt_dir):
-        print(f"No model averaging | Fine-tune model from: {ckpt_dir}")
+        print(f"No model averaging | Fine-tune model from: {ckpt_dir}", flush=True)
         ckpt_loaded = torch.load(ckpt_dir, map_location=torch.device('cpu'))
         # model.load_state_dict(ckpt_loaded, strict=False)
         if load_wavlm_only:
-            print("Loading WavLM only...")
+            print("Loading WavLM, Weighted sum and projection only...", flush=True)
             partly_load(model.wavlm_model, "wavlm_model.", ckpt_loaded)
             partly_load(model.weight_sum, "weight_sum.", ckpt_loaded)
             partly_load(model.proj, "proj.", ckpt_loaded)
             partly_load(model.lnorm, "lnorm.", ckpt_loaded)
+        elif csd:
+            print("Loading WavLM only...", flush=True)
+            partly_load(model.wavlm_model, "wavlm_model.", ckpt_loaded)
         else: # if not dont_load_wavlm:
             missing, unexpected = model.load_state_dict(ckpt_loaded, strict=False)
-            print("Missing Keys at model.load :", missing)
-            print("Unexpected Keys at model.load :", unexpected)
+            print("Missing Keys at model.load :", missing, flush=True)
+            print("Unexpected Keys at model.load :", unexpected, flush=True)
+
         if load_encoder is not None:
-            print("Loading encoder from:", load_encoder)
+            print("Loading encoder from:", load_encoder, flush=True)
             enc_ckpt_loaded = torch.load(load_encoder, map_location=torch.device('cpu'))
             new_state = fix_keys(enc_ckpt_loaded)
             partly_load(model.gcc_encoder, "gcc_encoder.", new_state)
             partly_load(model.proj_gcc, "proj_gcc.", new_state)
             partly_load(model.lnorm_gcc, "lnorm_gcc.", new_state)
         if load_spk_counting:
-            print("Loading speaker counting head...")
+            print("Loading speaker counting head...", flush=True)
             ckpt_loaded_spk = torch.load(load_spk_counting, map_location=torch.device('cpu'))
             # model.spk_counting.load_state_dict(ckpt_loaded_spk, strict=True)
             partly_load(model.spk_counting, "gcc_encoder.", ckpt_loaded_spk)

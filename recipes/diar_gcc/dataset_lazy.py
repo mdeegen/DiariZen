@@ -1,28 +1,31 @@
 # Licensed under the MIT license.
 # Copyright 2020 CNRS (author: Herve Bredin, herve.bredin@irit.fr)
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
+import itertools
 import math
 import os
 import random
-from pathlib import Path
 import re
+from pathlib import Path
+from typing import Dict
 
 import h5py
-
-import itertools
-import torch
 import numpy as np
 import paderbox as pb
 import soundfile as sf
-from typing import Dict
-
-from torch.utils.data import get_worker_info
+import torch
 from paderbox.io import dump_json, load_json
-from diarizen.spatial_features.gcc_phat import compute_vad_th, get_gcc_for_all_channel_pairs_torch
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
+
+from diarizen.spatial_features.gcc_phat import (
+    channel_wise_activities,
+    compute_vad_th,
+    convert_to_frame_wise_activities,
+    get_dominant_time_frequency_mask,
+    get_gcc_for_all_channel_pairs,
+    get_gcc_for_all_channel_pairs_torch,
+)
 from diarizen.spatial_features.segmentation import spatial_segmentation
-from torch.utils.data import Dataset, IterableDataset
-from diarizen.spatial_features.gcc_phat import (get_gcc_for_all_channel_pairs, channel_wise_activities,
-                                                convert_to_frame_wise_activities, get_dominant_time_frequency_mask)
 
 
 def get_dtype(value: int) -> str:
@@ -49,13 +52,15 @@ def get_dtype(value: int) -> str:
         return "i8"  # signed long (64 bits)
     return filtered_list[0][1]
 
+
 def load_scp(scp_file: str) -> Dict[str, str]:
-    """ return dictionary { rec: wav_rxfilename } """
+    """return dictionary { rec: wav_rxfilename }"""
     lines = [line.strip().split(None, 1) for line in open(scp_file)]
     return {x[0]: x[1] for x in lines}
 
+
 def load_uem(uem_file: str, debug=False) -> Dict[str, float]:
-    """ returns dictionary { recid: duration }  """
+    """returns dictionary { recid: duration }"""
     if not os.path.exists(uem_file):
         return None
     lines = [line.strip().split() for line in open(uem_file)]
@@ -63,7 +68,8 @@ def load_uem(uem_file: str, debug=False) -> Dict[str, float]:
         return {x[0]: [float(x[-2]), 120] for x in lines[:300]}
     else:
         return {x[0]: [float(x[-2]), float(x[-1])] for x in lines}
-    
+
+
 def _gen_chunk_indices(
     init_posi: int,
     data_len: int,
@@ -75,7 +81,9 @@ def _gen_chunk_indices(
     init_posi = int(init_posi)
     data_len = int(data_len)
     cur_len = data_len - init_posi
-    assert cur_len >= size, f"Data length {data_len} - {init_posi} too short for chunk size {size}."
+    assert (
+        cur_len >= size
+    ), f"Data length {data_len} - {init_posi} too short for chunk size {size}."
     num_chunks = int((cur_len - size + step) / step)
 
     for i in range(num_chunks):
@@ -83,10 +91,10 @@ def _gen_chunk_indices(
 
 
 def _gen_segment_indices(
-        init_posi: int,
-        data_len: int,
-        size: int,
-        step: int,
+    init_posi: int,
+    data_len: int,
+    size: int,
+    step: int,
 ) -> None:
     start = int(init_posi)
     end_limit = int(data_len)
@@ -99,7 +107,10 @@ def _gen_segment_indices(
         yield start, end
         start += int(step)
 
-def _collate_fn(batch, max_speakers_per_chunk=4, th=0.15, gcpsd=False) -> torch.Tensor:
+
+def _collate_fn(
+    batch, max_speakers_per_chunk=4, gcpsd=False, only_waveform=False
+) -> torch.Tensor:
     collated_x = []
     collated_y = []
     collated_names = []
@@ -116,20 +127,22 @@ def _collate_fn(batch, max_speakers_per_chunk=4, th=0.15, gcpsd=False) -> torch.
     for b in batch:
         # print("Example ID:", f"recording_{b['rec']}_{b['start']}", flush=True)
         id = f"{b['name']}_{b['start']}"
-        x = b['data']#.to(accelerator.device)
-        y = b['mask_label']#.to(accelerator.device)
-        name = b['name'][0]
-        gcc = b['gcc_features']#.to(accelerator.device)
+        x = b["data"]  # .to(accelerator.device)
+        y = b["mask_label"]  # .to(accelerator.device)
+        name = b["name"][0]
+        if not only_waveform:
+            gcc = b["gcc_features"]  # .to(accelerator.device)
+        else:
+            gcc = torch.zeros(1, 1, 1)
         # print(f'Processing {name} | {path} | {session_idx}')
         num_speakers = y.shape[-1]
         num_spk = np.sum(y, axis=-1, keepdims=True)
-
 
         if num_speakers > max_speakers_per_chunk:
             # sort speakers in descending talkativeness order
             indices = np.argsort(-np.sum(y, axis=0), axis=0)
             # keep only the most talkative speakers
-            y = y[:, indices[: max_speakers_per_chunk]]
+            y = y[:, indices[:max_speakers_per_chunk]]
 
         elif num_speakers < max_speakers_per_chunk:
             # create inactive speakers by zero padding
@@ -154,29 +167,24 @@ def _collate_fn(batch, max_speakers_per_chunk=4, th=0.15, gcpsd=False) -> torch.
     if gcpsd:
         try:
             return {
-                'xs': torch.from_numpy(np.stack(collated_x)).float(),
-                'ts': torch.from_numpy(np.stack(collated_y)),
+                "xs": torch.from_numpy(np.stack(collated_x)).float(),
+                "ts": torch.from_numpy(np.stack(collated_y)),
                 "ids": ids,
                 # 'names': collated_names,
                 # "names": {"items": collated_names},
                 "gccs": torch.stack(gccs).to(torch.complex64),
-                "num_spks": torch.from_numpy(np.stack(num_spks).astype(np.float32)).float(),
+                "num_spks": torch.from_numpy(
+                    np.stack(num_spks).astype(np.float32)
+                ).float(),
             }
         except Exception as e:
             print(f"Error in collate_fn with gcpsd: {e}")
             print(f"collated_x shapes: {[x.shape for x in collated_x]}")
             raise e
-
     else:
-        # try:
-        #     tmp = np.stack(collated_x)
-        # except Exception as e:
-        #     print(f"Error in collate_fn with gcpsd: {e}")
-        #     print(f"collated_x shapes: {[x.shape for x in collated_x]}")
-        #     raise e
         return {
-            'xs': torch.from_numpy(np.stack(collated_x)).float(),
-            'ts': torch.from_numpy(np.stack(collated_y)),
+            "xs": torch.from_numpy(np.stack(collated_x)).float(),
+            "ts": torch.from_numpy(np.stack(collated_y)),
             "ids": ids,
             # 'names': collated_names,
             # "names": {"items": collated_names},
@@ -186,11 +194,12 @@ def _collate_fn(batch, max_speakers_per_chunk=4, th=0.15, gcpsd=False) -> torch.
 
 
 class IterableWrapper(IterableDataset):
-    def __init__(self, dataset, len=None, rec_list=None):
+    def __init__(self, dataset, len=None, rec_list=None, subset="train"):
         self.dataset = dataset
         self.get_my_length = len
         self.distributed = False
         self.rec_list = rec_list
+        self.subset = subset
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -215,59 +224,64 @@ class IterableWrapper(IterableDataset):
             #     ).dataset
             #
             # ds = self._worker_datasets[worker_id]
-            print(f"Worker {worker_id}",flush=True) # !! doppelter aufruf der iter funktion aber nur einmal in trainings liste, nicht wundern
+            # print(f"Worker {worker_id}",flush=True) # !! doppelter aufruf der iter funktion aber nur einmal in trainings liste, nicht wundern
+
             ds = self.dataset.init_ds(worker_id, num_workers, self.rec_list).dataset
         else:
-            ds = self.dataset
+            ds = self.dataset  # .shuffle() if self.subset == "train" else self.dataset
         rank_iter = iter(ds)
         return rank_iter
         # return iter(self.dataset)
 
     def __len__(self):
-        # if self.cut is not None:
-        #     self.get_my_length = self.cut
         return self.get_my_length
 
 
 from lazy_dataset import from_list
 
+
 class DiarizationLazy:
     def __init__(
-            self,
-            scp_file: str,
-            rttm_file: str,
-            uem_file: str,
-            model_num_frames: int,  # default: wavlm_base
-            model_rf_duration: float,  # model.receptive_field.duration, seconds
-            model_rf_step: float,  # model.receptive_field.step, seconds
-            chunk_size: int = 5,  # seconds
-            chunk_shift: int = 5,  # seconds
-            sample_rate: int = 16000,
-            channel_mode: str = "multichannel",  # sdm, random, average, multichannel
-            load_gcc_dir=None,
-            subset="train",
-            num_channels=4,  # number of channels for multichannel mode
-            num_spk=False,
-            modelbased=False,
-            gcpsd=False,
-            acc = None,
-            sub_rec = True,
-            buffer_size = 500, # for shuffling # 300 first time
-            segment_size = 10 * 60,   # in seconds
-            segment_overlap = 0,         # in seconds
-            resample = False,
-            rotate = False,
-            debug=False,
-            num_workers=0,
-            gradient_accumulation_steps=1,
+        self,
+        scp_file: str,
+        rttm_file: str,
+        uem_file: str,
+        model_num_frames: int,  # default: wavlm_base
+        model_rf_duration: float,  # model.receptive_field.duration, seconds
+        model_rf_step: float,  # model.receptive_field.step, seconds
+        chunk_size: int = 5,  # seconds
+        chunk_shift: int = 5,  # seconds
+        sample_rate: int = 16000,
+        channel_mode: str = "multichannel",  # sdm, random, average, multichannel
+        load_gcc_dir=None,
+        subset="train",
+        num_channels=4,  # number of channels for multichannel mode
+        num_spk=False,
+        modelbased=False,
+        gcpsd=False,
+        acc=None,
+        sub_rec=True,
+        buffer_size=500,  # for shuffling # 300 first time
+        segment_size=10 * 60,  # in seconds
+        segment_overlap=0,  # in seconds
+        resample=False,
+        rotate=False,
+        debug=False,
+        num_workers=0,
+        gradient_accumulation_steps=1,
+        spk_count_loss=False,
+        batch_size=16,
+        shuffle=True,
     ):
         self.chunk_indices = []
         self.subset = subset
+        self.shuffle = shuffle
         self.buffer_size = buffer_size
         self.debug = debug
         self.sub_rec = sub_rec
         self.segment_size = segment_size
         self.segment_overlap = segment_overlap
+        self.spk_count_loss = spk_count_loss
 
         self.sample_rate = sample_rate
         self.chunk_sample_size = sample_rate * chunk_size
@@ -294,7 +308,10 @@ class DiarizationLazy:
         self.energy_th = {}
 
         self.num_workers = num_workers
+        self.batch_size = batch_size if isinstance(batch_size, int) else batch_size[0]
         self._length = 0
+        self.counter = 0
+
         # if acc is not None:
         self.world = acc.num_processes
         self.rank = acc.process_index
@@ -318,16 +335,20 @@ class DiarizationLazy:
                     # print(end_sec - start_sec, flush=True)
                     if end_sec - start_sec >= chunk_size_tmp:
                         try:
-                            for st, ed in _gen_segment_indices(start_sec, end_sec, chunk_size_tmp, chunk_shift_tmp):
+                            for st, ed in _gen_segment_indices(
+                                start_sec, end_sec, chunk_size_tmp, chunk_shift_tmp
+                            ):
                                 chunk_indices.append((rec, (st, ed)))  # seconds
                                 # print(f'asdChunked {rec} from {st} to {ed}', flush=True)
                                 # durations[counter % world] += ed - st
                                 # counter +=1
                                 # print(durations, sum(durations.values()), flush=True)
                         except Exception as e:
-                            print(f'Un-matched recording: {rec}', e)
+                            print(f"Un-matched recording: {rec}", e)
                     else:
-                        assert end_sec - start_sec >= self.chunk_size, f"Recording {rec} too short even for sub recording: {end_sec}, - {start_sec} <= {self.chunk_size}"
+                        assert (
+                            end_sec - start_sec >= self.chunk_size
+                        ), f"Recording {rec} too short even for sub recording: {end_sec}, - {start_sec} <= {self.chunk_size}"
                         chunk_indices.append((rec, (start_sec, end_sec)))  # seconds
                         # durations[counter % world] += end_sec - start_sec
                         # counter +=1
@@ -335,28 +356,95 @@ class DiarizationLazy:
             else:
                 chunk_indices = self.reco2dur.items()
 
-            rec_list = [(rec, dur) for i, (rec, dur) in enumerate(chunk_indices) if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)]  # List of (sub-) recordings, each as (rec, dur)
+            rec_list = [
+                (rec, dur)
+                for i, (rec, dur) in enumerate(chunk_indices)
+                if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)
+            ]  # List of (sub-) recordings, each as (rec, dur)
 
             # TODO: Seed festlegen, damit reproduzierbar geshufflet wird
             if self.subset == "train":
                 random.shuffle(rec_list)
-            dataset_length = sum([
-                max(0, int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift))  ##  - 2
-                for rec, dur in rec_list
-            ])
+            # dataset_length = sum([
+            #     max(0, int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift))  ##  - 2
+            #     for rec, dur in rec_list
+            # ])
+            #
+            # dataset_length = sum([
+            #     len(list(_gen_chunk_indices(0, dur[1] - dur[0], self.chunk_size, self.chunk_shift)))
+            #     for rec, dur in rec_list
+            # ])
+            dataset_length = sum(
+                [
+                    int(
+                        (dur[1] - dur[0] - self.chunk_size + self.chunk_shift)
+                        / self.chunk_shift
+                    )
+                    for rec, dur in rec_list
+                    if dur[1] - dur[0] >= self.chunk_size
+                ]
+            )
+
             lengths = [None] * self.world
             if self.world > 1:
-                torch.distributed.all_gather_object(lengths, dataset_length)  # len(rec_list) ) #
+                torch.distributed.all_gather_object(
+                    lengths, dataset_length
+                )  # len(rec_list) ) #
             else:
                 lengths = [dataset_length]
-            print(lengths, flush=True)
             self.max_len = max(lengths)
+            print("LÄNGEN:", lengths, self.max_len / self.batch_size, flush=True)
+
+            # # ensure all workers get same amount of batches
+            # N = self.num_workers * self.batch_size
+            # if (self.max_len % N) != 0:
+            #     self.max_len = math.ceil(self.max_len / N) * N
+
             num = sum(lengths)
-            delta = self.max_len  - dataset_length
-            print("Max length:", self.max_len , "number of chunks:", num, flush=True)
+            delta = self.max_len - dataset_length
+            # print(self.rank, "Max length:", self.max_len , "number of chunks:", num, flush=True)
 
             rec_list = self.extend_by_recording(rec_list, delta)
-            self.lazy = IterableWrapper(dataset=self, len=self.max_len * self.gradient_accumulation_steps, rec_list=rec_list)
+
+            if self.subset == "train" and self.shuffle:
+                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
+                print("shuffled", flush=True)
+            else:
+                filtered_lazy = from_list(rec_list)
+            filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
+            filtered_lazy = filtered_lazy.unbatch()
+
+            # # shuffling
+            # if self.subset == "train":
+            #     filtered_lazy = filtered_lazy.shuffle(reshuffle=True) #  if self.subset == "train" else self.rec_list
+            #     print("shuffled", flush=True)
+
+            # if True:
+            #     count = 0
+            #     for _ in filtered_lazy:
+            #         count += 1
+            #     print(f"Rank {self.rank}: Dataset length after unbatch: {count}", flush=True)
+            # print(f"Rank {self.rank} BERECHNETE LÄNGE", self._length, self._length/self.batch_size, flush=True)
+            # print(f"{self.rank}_COUTNER: ", self.counter, self.counter / self.batch_size, flush=True)
+
+            # TODO: Testing this? all workers same exmaples?
+            # dataset_length2 = sum([
+            #     max(0, int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift))  ##  - 2
+            #     for rec, dur in rec_list
+            # ])
+            # lengths2 = [None] * self.world
+            # torch.distributed.all_gather_object(lengths2, dataset_length2)  # len(rec_list) ) #
+            #
+            # print(lengths2, max(lengths2), flush=True)
+            # print(self.rank, len(rec_list), flush=True)
+
+            # self.lazy = IterableWrapper(dataset=self, len=self.max_len * self.gradient_accumulation_steps, rec_list=rec_list)
+            self.lazy = IterableWrapper(
+                dataset=self,
+                len=self.max_len * self.gradient_accumulation_steps,
+                rec_list=filtered_lazy,
+                subset=self.subset,
+            )
             return
         else:
             self.lazy = self.init_ds()
@@ -373,63 +461,56 @@ class DiarizationLazy:
                 # counter = 0
                 for rec, dur_info in self.reco2dur.items():
                     start_sec, end_sec = dur_info
-                    start_sec = start_sec + 1 # remove first s to avoid hard zeros
-                    end_sec = end_sec - 1   # remove last s to avoid hard zeros
+                    start_sec = start_sec + 1  # remove first s to avoid hard zeros
+                    end_sec = end_sec - 1  # remove last s to avoid hard zeros
                     # print(end_sec - start_sec, flush=True)
                     if end_sec - start_sec >= chunk_size_tmp:
                         try:
-                            for st, ed in _gen_segment_indices(start_sec,end_sec, chunk_size_tmp,chunk_shift_tmp):
+                            for st, ed in _gen_segment_indices(
+                                start_sec, end_sec, chunk_size_tmp, chunk_shift_tmp
+                            ):
                                 chunk_indices.append((rec, (st, ed)))  # seconds
                                 # print(f'asdChunked {rec} from {st} to {ed}', flush=True)
                                 # durations[counter % world] += ed - st
                                 # counter +=1
                                 # print(durations, sum(durations.values()), flush=True)
                         except Exception as e:
-                            print(f'Un-matched recording: {rec}', e)
+                            print(f"Un-matched recording: {rec}", e)
                     else:
-                        assert end_sec - start_sec >= self.chunk_size , f"Recording {rec} too short even for sub recording: {end_sec}, - {start_sec} <= {self.chunk_size}"
-                        chunk_indices.append((rec, (start_sec,end_sec)))  # seconds
+                        assert (
+                            end_sec - start_sec >= self.chunk_size
+                        ), f"Recording {rec} too short even for sub recording: {end_sec}, - {start_sec} <= {self.chunk_size}"
+                        chunk_indices.append((rec, (start_sec, end_sec)))  # seconds
                         # durations[counter % world] += end_sec - start_sec
                         # counter +=1
                     # assert False
             else:
                 chunk_indices = self.reco2dur.items()
 
-
-            rec_list = [(rec,  dur) for i, (rec, dur) in enumerate(chunk_indices) if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)]   # List of (sub-) recordings, each as (rec, dur)
+            rec_list = [
+                (rec, dur)
+                for i, (rec, dur) in enumerate(chunk_indices)
+                if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)
+            ]  # List of (sub-) recordings, each as (rec, dur)
 
             # TODO: Seed festlegen, damit reproduzierbar geshufflet wird
             if self.subset == "train":
                 random.shuffle(rec_list)
-            # # # shorten for testing pruposes
-            # rec_list = rec_list[::2]
 
-            # # skip
-            # skipping = True
-            # if skipping:
-            #     skip = int(2250  * 16 / 99)
-            #     rec_list = rec_list[skip:]
-
-            # len3 = sum([
-            #     max(1, int(math.floor(((dur[1] - dur[0]) - self.chunk_size) / self.chunk_shift) +1))
+            # dataset_length = sum([
+            #     max(0,int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift))  ##  - 2
             #     for rec, dur in rec_list
             # ])
-            # len2 = sum([
-            #     int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift)
-            #     for rec, dur in rec_list
-            # ])
-            # len4 = sum([
-            #     int((dur[1] - dur[0] -2 - self.chunk_size + self.chunk_shift) / self.chunk_shift)
-            #     for rec, dur in rec_list
-            # ]) + self.chunk_size
-            # len3 = sum([
-            #     max(1,int((dur[1] - dur[0] -2 - self.chunk_size + self.chunk_shift) / self.chunk_shift))
-            #     for rec, dur in rec_list
-            # ])
-            dataset_length = sum([
-                max(0,int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift))  ##  - 2
-                for rec, dur in rec_list
-            ])
+            dataset_length = sum(
+                [
+                    int(
+                        (dur[1] - dur[0] - self.chunk_size + self.chunk_shift)
+                        / self.chunk_shift
+                    )
+                    for rec, dur in rec_list
+                    if dur[1] - dur[0] >= self.chunk_size
+                ]
+            )
 
             # # # ------------------------------------
             # # OLD TEMP JUST TO COMPARE LENGTHS
@@ -439,33 +520,65 @@ class DiarizationLazy:
             # print(f"Rank {rank}: {counter} chunks, computed len: {dataset_length}", flush=True)
             # # # print("alles gleich?", rank, counter*8, len(rec_list) * 8, durations_chunks, flush=True)
 
-
             lengths = [None] * self.world
             if self.world > 1:
-                torch.distributed.all_gather_object(lengths, dataset_length) # len(rec_list) ) #
+                torch.distributed.all_gather_object(
+                    lengths, dataset_length
+                )  # len(rec_list) ) #
             else:
                 lengths = [dataset_length]
-            print(lengths, flush=True)
-            self.max_len  = max(lengths)
+            # print(lengths, flush=True)
+            self.max_len = max(lengths)
+            print("LÄNGEN:", lengths, self.max_len / self.batch_size, flush=True)
             num = sum(lengths)
-            delta = self.max_len  - dataset_length
-            print("Max length:", self.max_len , "number of chunks:", num, flush=True)
+            delta = self.max_len - dataset_length
+            # print("Max length:", self.max_len , "number of chunks:", num, flush=True)
 
             rec_list = self.extend_by_recording(rec_list, delta)
 
-        else: # total_num_workers > 1:
-            # print(f"worker number {worker_id}", rec_list[:10], flush=True)
-            rec_list = [(rec, dur) for i, (rec, dur) in enumerate(rec_list)
-                        if (i % total_num_workers == worker_id)]
-            # print(f"worker number {worker_id}", rec_list[:10], flush=True)
-            # print(f"\n{self.rank}___{worker_id}__RECORDING LIST:\n", rec_list, flush=True)
-            # # Länge muss berechnet werden damit die über die
-            # rec_list_0 = [(rec, dur) for i, (rec, dur) in enumerate(rec_list)
+            if self.subset == "train" and self.shuffle:
+                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
+            else:
+                filtered_lazy = from_list(rec_list)
+            filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
+            filtered_lazy = filtered_lazy.unbatch()
+            # shuffling
+            # if self.subset == "train":
+            #     filtered_lazy = filtered_lazy.shuffle(reshuffle=True) #  if self.subset == "train" else self.rec_list
+            #     print("shuffled", flush=True)
+            # if True:
+            #     count = 0
+            #     for _ in filtered_lazy:
+            #         count += 1
+            #     print(f"Rank {self.rank}: Dataset length after unbatch: {count}", flush=True)
+            #     print(f"Rank {self.rank} BERECHNETE LÄNGE", self._length, self._length/self.batch_size, flush=True)
+            #     print(f"{self.rank}_COUTNER: ", self.counter, self.counter / self.batch_size, flush=True)
+
+        else:  # total_num_workers > 1:
+            # # Berechne Chunks pro Recording vorher
+            # rec_with_chunks = []
+            # for rec, dur in rec_list:
+            #     num_chunks = max(0, int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift))
+            #     rec_with_chunks.append(((rec, dur), num_chunks))
             #
+            # # Verteile Recordings so, dass jeder Worker ähnlich viele Chunks bekommt
+            # worker_chunks = [0] * total_num_workers
+            # worker_recs = [[] for _ in range(total_num_workers)]
             #
-            #             if (i % self.num_workers == 0 and dur[1] - dur[0] >= self.chunk_size)]
-            # rec_list_1 = [(rec, dur) for i, (rec, dur) in enumerate(rec_list)
-            #             if (i % self.num_workers == 1 and dur[1] - dur[0] >= self.chunk_size)]
+            # # Greedy-Verteilung: größte Recordings zuerst
+            # rec_with_chunks.sort(key=lambda x: x[1], reverse=True)
+            # for (rec, dur), num_chunks in rec_with_chunks:
+            #     min_worker = min(range(total_num_workers), key=lambda w: worker_chunks[w])
+            #     worker_recs[min_worker].append((rec, dur))
+            #     worker_chunks[min_worker] += num_chunks
+            #
+            # rec_list = worker_recs[worker_id]
+
+            filtered_lazy = rec_list.filter(
+                lambda x: x["counter"] % total_num_workers == worker_id
+            )
+            # rec_list = [(rec, dur) for i, (rec, dur) in enumerate(rec_list)
+            #             if (i % total_num_workers == worker_id)]
 
         # # rec_list.extend(rec_list[:delta])
         # rec_list_tmp, durations_chunks, counter = self.chunk_recordings(rec_list)
@@ -474,35 +587,35 @@ class DiarizationLazy:
         # torch.distributed.all_gather_object(lengths2, len(rec_list_tmp) ) #
         # print(lengths2, flush=True)
 
-        # ------------------------------------
-
-        # # old
+        # # ------------------------------------
         # filtered_lazy = from_list(rec_list)
-        # filtered_lazy = filtered_lazy.shuffle(buffer_size=300, reshuffle=True)
-        # filtered_lazy = filtered_lazy.map(self.extract_wavforms)
-        # filtered_lazy = filtered_lazy.map(self.get_chunk_labels)
-        # filtered_lazy = filtered_lazy.map(self.get_spatial_features)
-        # self.lazy = filtered_lazy.map(self.to_dict)
-        # self.lazy = IterableWrapper(self.lazy, len=world * len(rec_list))
-        filtered_lazy = from_list(rec_list)
-        filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
-        filtered_lazy = filtered_lazy.unbatch()
+        # filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
+        # filtered_lazy = filtered_lazy.unbatch()
+        # # if True:
+        # #     count = 0
+        # #     for _ in filtered_lazy:
+        # #         count += 1
+        # #     print(f"Rank {self.rank}: Dataset length after unbatch: {count}", flush=True)
+        #     print(f"Rank {self.rank} BERECHNETE LÄNGE", self._length, flush=True)
         filtered_lazy = filtered_lazy.map(self.get_chunk_labels)
-        filtered_lazy = filtered_lazy.map(self.get_spatial_features)
+        if not self.spk_count_loss:
+            filtered_lazy = filtered_lazy.map(self.get_spatial_features)
         lazy = filtered_lazy.map(self.to_dict)
         if self.subset == "train" and not self.debug:
             lazy = lazy.shuffle(buffer_size=self.buffer_size, reshuffle=True)
         # print('Final length:', self.max_len , flush=True)
         if self.rotate:
             lazy = lazy.map(self.rotate_channels)
-        self.lazy = IterableWrapper(lazy, len=self.max_len * self.gradient_accumulation_steps) #, cut_to=32) # world *
+        self.lazy = IterableWrapper(
+            lazy,
+            len=self.max_len * self.gradient_accumulation_steps,
+            subset=self.subset,
+        )  # , cut_to=32) # world *
         # self.lazy = MapWrapper(lazy, len=world)
         self._length = self.max_len
+        # print(f"MAX {self.rank} LEN: ", self.max_len, flush=True)
 
         return self.lazy
-
-
-
 
         # # lazy = lazy.shuffle()
         #
@@ -522,14 +635,16 @@ class DiarizationLazy:
         # self.lazy = IterableWrapper(self.lazy, len=world * len(rec_list))
 
     def __len__(self):
-        return self._length
+        return self.max_len
 
     def rotate_channels(self, example):
         if self.rotate:
-            rotation = random.randint(0, self.num_channels -1)
-            ch_idx = (np.arange(example['data'].shape[0]) + rotation) % example['data'].shape[0]
-            example['data'] = example['data'][ch_idx, :]
-            example['ch_idx'] = ch_idx
+            rotation = random.randint(0, self.num_channels - 1)
+            ch_idx = (np.arange(example["data"].shape[0]) + rotation) % example[
+                "data"
+            ].shape[0]
+            example["data"] = example["data"][ch_idx, :]
+            example["ch_idx"] = ch_idx
         return example
 
     def extend_by_recording(self, rec_list, delta):
@@ -540,7 +655,9 @@ class DiarizationLazy:
         while current_delta < delta:
             rec, dur = rec_list[idx % n_rec]
             L = dur[1] - dur[0]
-            num_chunks = max(0, int((L - self.chunk_size + self.chunk_shift) / self.chunk_shift))  #  -2
+            num_chunks = max(
+                0, int((L - self.chunk_size + self.chunk_shift) / self.chunk_shift)
+            )  #  -2
             space_left = delta - current_delta
 
             if num_chunks <= space_left:
@@ -556,15 +673,16 @@ class DiarizationLazy:
                 # never exceed original end
                 new_end = min(new_end, dur[1])
                 extended.append((rec, (dur[0], new_end)))
-                assert new_end - dur[0] >= self.chunk_size , f"Not enough length to produce needed chunks: {new_end} - {dur[0]} < {self.chunk_size}, needed still {needed}"
+                assert (
+                    new_end - dur[0] >= self.chunk_size
+                ), f"Not enough length to produce needed chunks: {new_end} - {dur[0]} < {self.chunk_size}, needed still {needed}"
                 current_delta += needed
                 break
 
             idx += 1
 
-        print(f'Extended by {current_delta} chunks to match max length {delta}, rank: ', self.rank, flush=True)
+        # print(f'Extended by {current_delta} chunks to match max length {delta}, rank: ', self.rank, flush=True)
         return extended
-
 
     def extract_wavforms_and_chunk(self, example):
         # TODO: get list of starts and end and then [chunk for st,end in ...] und unbtahc
@@ -580,35 +698,51 @@ class DiarizationLazy:
             # IF not on Merlin try Noctua2
             # path = path.replace("/mnt/*/AMI_AIS_ALI_NSF_CHiME7",
             #                     "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7")
-            path = re.sub(r"^/mnt/[^/]+/AMI_AIS_ALI_NSF_CHiME7", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7", path)
+            path = re.sub(
+                r"^/mnt/[^/]+/AMI_AIS_ALI_NSF_CHiME7",
+                "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7",
+                path,
+            )
         if not os.path.exists(path):
             # IF not on noctua try on NT network
-            path = re.sub(r"/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7", "/net/vol/deegen/db/AMI_AIS_ALI_NSF_CHiME7", path)
+            path = re.sub(
+                r"/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7",
+                "/net/vol/deegen/db/AMI_AIS_ALI_NSF_CHiME7",
+                path,
+            )
         try:
             # load sub recording segment
             start_samples = int(start * self.sample_rate)
             end_samples = int(end * self.sample_rate)
-            rec_len = end- start
+            rec_len = end - start
             data, sample_rate = sf.read(path, start=start_samples, stop=end_samples)
         except Exception as e:
             print(f"Error reading {path} from {start} to {end}: {e}")
             raise RuntimeError(f"Error reading {path} from {start} to {end}: {e}")
-        assert sample_rate == self.sample_rate, f"Sample rate mismatch: {sample_rate} != {self.sample_rate}"
+        assert (
+            sample_rate == self.sample_rate
+        ), f"Sample rate mismatch: {sample_rate} != {self.sample_rate}"
 
         if data.ndim == 1:
             data = data.reshape(1, -1)
         else:
-            data = np.einsum('tc->ct', data)
+            data = np.einsum("tc->ct", data)
         # p(data.shape)
-        assert data.shape[-1] <= rec_len * self.sample_rate, f"Data length mismatch: {data.shape[-1]} != {rec_len * self.sample_rate}, {path}, {start}, {end}"
+        assert (
+            data.shape[-1] <= rec_len * self.sample_rate
+        ), f"Data length mismatch: {data.shape[-1]} != {rec_len * self.sample_rate}, {path}, {start}, {end}"
         data = data[self.get_mic_selection(Path(path).stem), :]
         # generate chunks for this sub_recording
         # if end - start < self.chunk_size+2 :
         #     print(f"{self.rank} Sub-recording too short for chunking: {rec}, {start}, {end}, length: {end - start}", flush=True)
-        if end - start >= self.chunk_size :   #  TODO: remove +2 and adjust the same in get_chunk_indices or find reason why chunks should be 2 seconds longer alwyys?
+        if (
+            end - start >= self.chunk_size
+        ):  #  TODO: remove +2 and adjust the same in get_chunk_indices or find reason why chunks should be 2 seconds longer alwyys?
             examples = []
             # TODO: start und end sind noch absolut, muss auf neue segmente bezogen werden!!
-            for st, ed in _gen_chunk_indices(0, rec_len, self.chunk_size, self.chunk_shift):
+            for st, ed in _gen_chunk_indices(
+                0, rec_len, self.chunk_size, self.chunk_shift
+            ):
                 # print(f'Chunked {rec} from {st} to {ed}', flush=True)
                 # TODO: START UND END SIND NICHT MIT GLOBAL SONDEN NUR LOKAL RICHTIG!!!
                 # if self.rotate:
@@ -618,16 +752,23 @@ class DiarizationLazy:
                 #     # data_rotated = data
                 #     rotation = 0
                 # ch_idx = (np.arange(data.shape[0]) + rotation) % data.shape[0]
-                examples.append({
-                    "rec": rec,
-                    "audio_path": path,
-                    "global_start": start,
-                    "start": start + st,
-                    "end": start + ed,
-                    "data": data[:, int(st*self.sample_rate):int(ed*self.sample_rate)],
-                    # "data": data_rotated[:, int(st*self.sample_rate):int(ed*self.sample_rate)],
-                    # "ch_idx": ch_idx,
-                })
+                examples.append(
+                    {
+                        "counter": self.counter,
+                        "rec": rec,
+                        "audio_path": path,
+                        "global_start": start,
+                        "start": start + st,
+                        "end": start + ed,
+                        "data": data[
+                            :, int(st * self.sample_rate) : int(ed * self.sample_rate)
+                        ],
+                        # "data": data_rotated[:, int(st*self.sample_rate):int(ed*self.sample_rate)],
+                        # "ch_idx": ch_idx,
+                    }
+                )
+                self.counter = self.counter + 1
+
             self._length += len(examples)
 
         # else:
@@ -641,6 +782,10 @@ class DiarizationLazy:
         #     # get random example for debugging, with fixed seed for reproducibility
         #     random.seed(42)
         #     examples = [random.choice(examples)]
+
+        # return examples
+        if self.subset == "train" and self.shuffle:
+            random.shuffle(examples)
         return examples
 
     def chunk_recordings(self, rec_list):
@@ -651,14 +796,25 @@ class DiarizationLazy:
             start_sec, end_sec = dur_info
             # if end_sec - start_sec >= self.chunk_size:
             try:
-                for st, ed in _gen_chunk_indices(start_sec,end_sec, self.chunk_size, self.chunk_shift):
-                    chunk_indices.append({"rec": rec, "audio_path" : self.rec_scp[rec], "start": st, "end": ed})  # seconds
+                for st, ed in _gen_chunk_indices(
+                    start_sec, end_sec, self.chunk_size, self.chunk_shift
+                ):
+                    chunk_indices.append(
+                        {
+                            "rec": rec,
+                            "audio_path": self.rec_scp[rec],
+                            "start": st,
+                            "end": ed,
+                        }
+                    )  # seconds
                     durations_chunks += ed - st
-                    assert ed - st == self.chunk_size, f"Chunk size mismatch: {ed - st} != {self.chunk_size}, {rec}, {st}, {ed}"
-                    counter +=1
+                    assert (
+                        ed - st == self.chunk_size
+                    ), f"Chunk size mismatch: {ed - st} != {self.chunk_size}, {rec}, {st}, {ed}"
+                    counter += 1
             except Exception as e:
                 # print(end_sec - start_sec, start_sec, end_sec, ed-st, ed, st, self.chunk_size, self.chunk_shift)
-                print(f'456Un-matched recording: {rec}', end_sec , start_sec, e)
+                print(f"456Un-matched recording: {rec}", end_sec, start_sec, e)
             # else:
             #     chunk_indices.append(
             #         {"rec": rec, "audio_path": self.rec_scp[rec], "start": start_sec, "end": end_sec})  # seconds
@@ -666,17 +822,22 @@ class DiarizationLazy:
             #     counter +=1
         return chunk_indices, durations_chunks, counter
 
-    def count_active_speakers_intervals(self, chunk_start, chunk_end, chunked_annotations):
+    def count_active_speakers_intervals(
+        self, chunk_start, chunk_end, chunked_annotations
+    ):
         """
         chunk_start, chunk_end: float (Sekunden)
         chunked_annotations: np.array mit Feldern start, end, label_idx
                              (bereits auf Session und Chunk gefiltert)
         """
         # Intervalle auf Chunk zuschneiden
-        intervals = np.stack([
-            np.maximum(chunked_annotations["start"], chunk_start),
-            np.minimum(chunked_annotations["end"], chunk_end),
-        ], axis=1)
+        intervals = np.stack(
+            [
+                np.maximum(chunked_annotations["start"], chunk_start),
+                np.minimum(chunked_annotations["end"], chunk_end),
+            ],
+            axis=1,
+        )
 
         # Events für Sweep-Line
         events = []
@@ -701,43 +862,59 @@ class DiarizationLazy:
         start_sec, end_sec = dur_info
         try:
             if self.chunk_size > 0:
-                for st, ed in _gen_chunk_indices(start_sec, end_sec, self.chunk_size, self.chunk_shift):
+                for st, ed in _gen_chunk_indices(
+                    start_sec, end_sec, self.chunk_size, self.chunk_shift
+                ):
                     chunk_indices.append((rec, self.rec_scp[rec], st, ed))
             else:
-                chunk_indices.append((rec, self.rec_scp[rec], start_sec, end_sec))  # recording id, audio path(?), seconds
+                chunk_indices.append(
+                    (rec, self.rec_scp[rec], start_sec, end_sec)
+                )  # recording id, audio path(?), seconds
         except Exception as e:
-            print(f'Un-matched recording: {rec}', e)
-        chunked_example = [{
-            "rec" : rec,
-            "audio_path" : audio_path,
-            "start_sec" : start_sec,
-            "end_sec" : end_sec}
-            for rec, audio_path, start_sec, end_sec in chunk_indices]
+            print(f"Un-matched recording: {rec}", e)
+        chunked_example = [
+            {
+                "rec": rec,
+                "audio_path": audio_path,
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+            }
+            for rec, audio_path, start_sec, end_sec in chunk_indices
+        ]
         return chunked_example
 
     def get_chunk_labels(self, example):
-        session, chunk_start, chunk_end = example['rec'], example['start'], example['end'] # , example['global_start']
+        session, chunk_start, chunk_end = (
+            example["rec"],
+            example["start"],
+            example["end"],
+        )  # , example['global_start']
         # chunk_start = global_start + chunk_start
         # chunk_end = global_start + chunk_end
         # chunked annotations
         session_idx = self.get_session_idx(session)
-        annotations_session = self.annotations[self.annotations['session_idx'] == session_idx]
+        annotations_session = self.annotations[
+            self.annotations["session_idx"] == session_idx
+        ]
         chunked_annotations = annotations_session[
-            (annotations_session["start"] < chunk_end) & (annotations_session["end"] > chunk_start)
-            ]
+            (annotations_session["start"] < chunk_end)
+            & (annotations_session["end"] > chunk_start)
+        ]
 
         # discretize chunk annotations at model output resolution
         step = self.model_rf_step
         half = 0.5 * self.model_rf_duration
 
-        start = np.maximum(chunked_annotations["start"], chunk_start) - chunk_start - half
+        start = (
+            np.maximum(chunked_annotations["start"], chunk_start) - chunk_start - half
+        )
         start_idx = np.maximum(0, np.round(start / step)).astype(int)
 
         end = np.minimum(chunked_annotations["end"], chunk_end) - chunk_start - half
         end_idx = np.round(end / step).astype(int)
 
         # get list and number of labels for current scope
-        labels = list(np.unique(chunked_annotations['label_idx']))
+        labels = list(np.unique(chunked_annotations["label_idx"]))
         num_labels = len(labels)
 
         mask_label = np.zeros((self.model_num_frames, num_labels), dtype=np.uint8)
@@ -745,12 +922,12 @@ class DiarizationLazy:
         # map labels to indices
         mapping = {label: idx for idx, label in enumerate(labels)}
         for start, end, label in zip(
-                start_idx, end_idx, chunked_annotations['label_idx']
+            start_idx, end_idx, chunked_annotations["label_idx"]
         ):
             mapped_label = mapping[label]
-            mask_label[start: end + 1, mapped_label] = 1
+            mask_label[start : end + 1, mapped_label] = 1
 
-        example['mask_label'] = mask_label
+        example["mask_label"] = mask_label
 
         # # for debug plot the labels and save the audio on disk
         # import matplotlib.pyplot as plt
@@ -771,7 +948,13 @@ class DiarizationLazy:
         return example
 
     def get_spatial_features(self, example):
-        session, path, chunk_start, chunk_end, data = example['rec'], example['audio_path'], example['start'], example['end'], example['data']#, example['ch_idx']
+        session, path, chunk_start, chunk_end, data = (
+            example["rec"],
+            example["audio_path"],
+            example["start"],
+            example["end"],
+            example["data"],
+        )  # , example['ch_idx']
         # data = data[ch_idx, :]  # apply channel rotation if any
 
         if self.load_gcc_dir == "base":
@@ -786,17 +969,26 @@ class DiarizationLazy:
             # gcc_features = gcc_features[:, :, k_min:k_max]   # 216 freq bins long
 
             data_pad = self.pad_data(data, size=fft_size)
-            sigs_stft = pb.transform.stft(data_pad[0], size=fft_size, shift=320,
-                                          pad=False, fading=False)
-            magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max])  # (frames, freq))
-            gcc_features = self.compute_gcc(data_pad, frame_size_gcc=fft_size, frame_shift_gcc=320, f_max_gcc=fmax,
-                                            f_min=fmin,
-                                            apply_ifft=apply_ifft)
-
+            sigs_stft = pb.transform.stft(
+                data_pad[0], size=fft_size, shift=320, pad=False, fading=False
+            )
+            magnitude = torch.from_numpy(
+                np.abs(sigs_stft)[:, k_min:k_max]
+            )  # (frames, freq))
+            gcc_features = self.compute_gcc(
+                data_pad,
+                frame_size_gcc=fft_size,
+                frame_shift_gcc=320,
+                f_max_gcc=fmax,
+                f_min=fmin,
+                apply_ifft=apply_ifft,
+            )
 
             if magnitude is not None:
                 # TODO: MAGNITUDE IN GCC ÜBERGEBEN und überall anpassen
-                gcc_features = torch.concat([gcc_features, magnitude[:, None, :]], dim=1)
+                gcc_features = torch.concat(
+                    [gcc_features, magnitude[:, None, :]], dim=1
+                )
         else:
             apply_ifft = False
             fmin = 125
@@ -807,28 +999,45 @@ class DiarizationLazy:
             # gcc_features = gcc_features[:, :, k_min:k_max]   # 216 freq bins long
 
             data_pad = self.pad_data(data, size=fft_size)
-            sigs_stft = pb.transform.stft(data_pad[0], size=fft_size, shift=320,
-                                          pad=False, fading=False)
-            magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max])  # (frames, freq))
+            sigs_stft = pb.transform.stft(
+                data_pad[0], size=fft_size, shift=320, pad=False, fading=False
+            )
+            magnitude = torch.from_numpy(
+                np.abs(sigs_stft)[:, k_min:k_max]
+            )  # (frames, freq))
 
-
-            gcc_features = self.compute_gcc(data_pad, frame_size_gcc=fft_size, frame_shift_gcc=320, f_max_gcc=fmax,
-                                            f_min=fmin,
-                                            apply_ifft=apply_ifft)
+            gcc_features = self.compute_gcc(
+                data_pad,
+                frame_size_gcc=fft_size,
+                frame_shift_gcc=320,
+                f_max_gcc=fmax,
+                f_min=fmin,
+                apply_ifft=apply_ifft,
+            )
             if magnitude is not None:
-                gcc_features = torch.concat([gcc_features, magnitude[:, None, :]], dim=1)
-        example['gcc_features'] = gcc_features
+                gcc_features = torch.concat(
+                    [gcc_features, magnitude[:, None, :]], dim=1
+                )
+        example["gcc_features"] = gcc_features
         return example
 
     def to_dict(self, ex):
         # print(f"DDP Worker: {self.rank}", ex["rec"], flush=True)
-        return {
-            "data": ex["data"],
-            "mask_label": ex["mask_label"],
-            "name": ex["rec"],
-            "gcc_features": ex["gcc_features"],
-            "start": ex["start"],
-        }
+        if self.spk_count_loss:
+            return {
+                "data": ex["data"],
+                "mask_label": ex["mask_label"],
+                "name": ex["rec"],
+                "start": ex["start"],
+            }
+        else:
+            return {
+                "data": ex["data"],
+                "mask_label": ex["mask_label"],
+                "name": ex["rec"],
+                "gcc_features": ex["gcc_features"],
+                "start": ex["start"],
+            }
 
     def get_session_idx(self, session):
         """
@@ -837,14 +1046,13 @@ class DiarizationLazy:
         session_keys = list(self.rec_scp.keys())
         return session_keys.index(session)
 
-
     def rttm2label(self, rttm_file):
-        '''
+        """
         SPEAKER train100_306 1 15.71 1.76 <NA> <NA> 5456 <NA> <NA>
-        '''
+        """
         annotations = []
         session_lst = []
-        with open(rttm_file, 'r') as file:
+        with open(rttm_file, "r") as file:
             for seg_idx, line in enumerate(file):
                 line = line.split()
                 session, start, dur = line[1], line[3], line[4]
@@ -864,12 +1072,7 @@ class DiarizationLazy:
                 label_idx = unique_label_lst.index(spk)
 
                 annotations.append(
-                    (
-                        self.get_session_idx(session),
-                        start,
-                        end,
-                        label_idx
-                    )
+                    (self.get_session_idx(session), start, end, label_idx)
                 )
 
         segment_dtype = [
@@ -884,20 +1087,31 @@ class DiarizationLazy:
 
         return np.array(annotations, dtype=segment_dtype)
 
-    def compute_gcc(self, waveforms_mc, frame_size_gcc=4096, frame_shift_gcc=311, avg_len_gcc=4,
-                    search_range_gcc=10, f_max_gcc=None, f_min=125, apply_ifft=True):
+    def compute_gcc(
+        self,
+        waveforms_mc,
+        frame_size_gcc=4096,
+        frame_shift_gcc=311,
+        avg_len_gcc=4,
+        search_range_gcc=10,
+        f_max_gcc=None,
+        f_min=125,
+        apply_ifft=True,
+    ):
         """
         Compute GCC features from multichannel waveforms.
         returns:
             batch_gcc_features: (batch, frame, channel, channel, search_range)
         """
         # TODO: try different stft values for better gcc but need fit frames of WAVLM
-        sigs_stft = pb.transform.stft(waveforms_mc, frame_size_gcc, frame_shift_gcc,
-                                      pad=False, fading=False)
+        sigs_stft = pb.transform.stft(
+            waveforms_mc, frame_size_gcc, frame_shift_gcc, pad=False, fading=False
+        )
         sigs_stft = torch.from_numpy(sigs_stft)  # (frames, channels, freq)
-        gcc_features = get_gcc_for_all_channel_pairs_torch(sigs_stft, f_min=f_min, f_max=f_max_gcc, apply_ifft=apply_ifft)
+        gcc_features = get_gcc_for_all_channel_pairs_torch(
+            sigs_stft, f_min=f_min, f_max=f_max_gcc, apply_ifft=apply_ifft
+        )
         return gcc_features
-
 
     def get_mic_selection(self, rec):
         if rec.startswith(("S3")):
@@ -906,41 +1120,54 @@ class DiarizationLazy:
             mics = [0, 2, 4, 6]  # default
         return mics
 
-
     def extract_wavforms(self, example):
         num_channels = self.num_channels
-        rec , path, start, end = example["rec"], example["audio_path"], example["start"], example["end"]
+        rec, path, start, end = (
+            example["rec"],
+            example["audio_path"],
+            example["start"],
+            example["end"],
+        )
         # 4 for debugging and smaller memory and faster dev
         start = int(start * self.sample_rate)
         # TODO' random channel selection and augmentation
         end = int(end * self.sample_rate)
-        assert end-start == self.chunk_sample_size, f"Chunk size mismatch: {end - start} != {self.chunk_sample_size}, {rec}, {start}, {end}"
+        assert (
+            end - start == self.chunk_sample_size
+        ), f"Chunk size mismatch: {end - start} != {self.chunk_sample_size}, {rec}, {start}, {end}"
         # # if system is noctua, change path to noctua2
         if not os.path.exists(path):
             # path = path.replace("/mnt/*/AMI_AIS_ALI_NSF_CHiME7",
             #                     "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7")
-            path = re.sub(r"^/mnt/[^/]+/AMI_AIS_ALI_NSF_CHiME7", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7", path)
+            path = re.sub(
+                r"^/mnt/[^/]+/AMI_AIS_ALI_NSF_CHiME7",
+                "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7",
+                path,
+            )
 
         try:
             data, sample_rate = sf.read(path, start=start, stop=end)
         except Exception as e:
             print(f"Error reading {path} from {start} to {end}: {e}")
             raise RuntimeError(f"Error reading {path} from {start} to {end}: {e}")
-        assert sample_rate == self.sample_rate, f"Sample rate mismatch: {sample_rate} != {self.sample_rate}"
+        assert (
+            sample_rate == self.sample_rate
+        ), f"Sample rate mismatch: {sample_rate} != {self.sample_rate}"
 
         if data.ndim == 1:
             data = data.reshape(1, -1)
         else:
-            data = np.einsum('tc->ct', data)
+            data = np.einsum("tc->ct", data)
 
         example["data"] = data[self.get_mic_selection(Path(path).stem), :]
-        assert example["data"].shape[1] == self.chunk_sample_size, f"Data shape mismatch: {example['data'].shape[1]} != {self.chunk_sample_size}"
+        assert (
+            example["data"].shape[1] == self.chunk_sample_size
+        ), f"Data shape mismatch: {example['data'].shape[1]} != {self.chunk_sample_size}"
         return example
-
 
     def load_gccs(self, path, start, end, load_gcc_dir):
         load_gcc_dir = Path(load_gcc_dir) / self.subset
-        index = load_json(load_gcc_dir / 'index.json')
+        index = load_json(load_gcc_dir / "index.json")
         if not load_gcc_dir:
             raise FileNotFoundError(f"GCC directory {load_gcc_dir} does not exist")
         file_stem = Path(path).stem
@@ -952,18 +1179,19 @@ class DiarizationLazy:
             h5_filename = load_gcc_dir / h5_filename
         if not h5_filename.exists():
             raise FileNotFoundError(f"HDF5 file {h5_filename} not found")
-        with h5py.File(h5_filename, 'r') as f:
+        with h5py.File(h5_filename, "r") as f:
             if file_stem not in f:
                 raise KeyError(f"Group '{file_stem}' not found in {h5_filename}")
             grp = f[file_stem]
             if segment_id not in grp:
-                raise KeyError(f"Segment ID '{segment_id}' not found in group '{file_stem}'")
+                raise KeyError(
+                    f"Segment ID '{segment_id}' not found in group '{file_stem}'"
+                )
             gcc_features = grp[segment_id][()]
         return gcc_features
 
     def get_num_frames(self, L, n_fft, hop):
         return math.floor((L - n_fft) / hop) + 1
-
 
     def pad_data(self, data, size=4096):
         L = data.shape[-1]

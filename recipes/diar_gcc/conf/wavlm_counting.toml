@@ -1,13 +1,11 @@
 [meta]
 save_dir = "exp"
 seed = 3407
-gcpsd = true
+gcpsd = false
 
 [finetune]
-finetune = true
+finetune = false
 avg_ckpt_num = 1
-ckpt_dir = "/mnt/matylda3/ihan/project/diarization/huggingface_hub/diarizen-wavlm-base-s80-md/pytorch_model.bin"
-load_wavlm_only = false
 
 [trainer]
 path = "trainer_dual_opt.Trainer"
@@ -39,26 +37,16 @@ path = "torch.optim.AdamW"
 lr = 1e-3
 
 [model]
-path = "diarizen.models.encoder_only.wavlm_spk_counting.Model" # "model_mc_channel_att.Model" # only change here to my model
+path = "diarizen.models.wavlm.wavlm_counting.Model"
 [model.args]
-wavlm_src = "wavlm_base_s80_md"
-wavlm_layer_num = 13
-wavlm_feat_dim = 768
-attention_in = 256
-ffn_hidden = 1024
-num_head = 4
-num_layer = 4
-dropout = 0.1
+#model_path = "/scratch/hpc-prf-nt2/deegen/models/wavlm_base_plus"
 chunk_size = 8
-use_posi = false
-output_activate_function = false
-max_speakers_per_chunk = 4
+max_speakers_per_chunk = 3
 selected_channel = 0
 
 [train_dataset]
-path = "dataset.DiarizationDataset"
+path = "dataset_lazy.DiarizationLazy"
 [train_dataset.args]
-load_gcc_dir = "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/gcpsd_1024_new/"  #  false  #
 gcpsd = true
 subset = "train"  # "train"  # "dev"
 scp_file = "data_no_chime/train/wav.scp"
@@ -70,16 +58,15 @@ sample_rate = 16000
 channel_mode = "multichannel"
 
 [train_dataset.dataloader]
-batch_size = 16
-num_workers = 1  # increase data loaders for gcc computation? instead maybe more prefatch
+batch_size = 64
+num_workers = 3  # increase data loaders for gcc computation? instead maybe more prefatch
 drop_last = true
 pin_memory = true
-prefetch_factor = 20
+prefetch_factor = 3
 
 [validate_dataset]
-path = "dataset.DiarizationDataset"
+path = "dataset_lazy.DiarizationLazy"
 [validate_dataset.args]
-load_gcc_dir = "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/gcpsd_1024_new/"  #  false  #
 gcpsd = true
 subset = "dev"  # "train"  # "dev"
 scp_file = "data_no_chime/dev/wav.scp"
@@ -91,9 +78,9 @@ sample_rate = 16000
 channel_mode = "multichannel"
 
 [validate_dataset.dataloader]
-batch_size = 16
-num_workers = 1
+batch_size = 64
+num_workers = 3
 drop_last = true
 pin_memory = true
-prefetch_factor = 20
+prefetch_factor = 3
 

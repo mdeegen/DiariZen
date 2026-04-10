@@ -11,12 +11,14 @@ BATCHFILE_TEMPLATE_EVAL = """#!/bin/bash
 #SBATCH --error {nickname}_eval_%j.err
 #SBATCH -J {nickname}_eval
 #SBATCH --gres=gpu:a100:4            # 4 GPU
-#SBATCH --mem=130G               # entspricht mem_free
+#SBATCH --mem=450G               # entspricht mem_free
 #SBATCH --ntasks=1          # slurm und accelerate get into conflict => slurm =1
+
+#SBATCH --cpus-per-task=16          # 4 CPUs per GPU
 
 
 cd /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc
-srun bash run_stage_noctua2_lazy.sh n2_spk_count_linear_noisy_to_gcpsd_encoder_ffn_film_all_layers
+srun bash run_stage_noctua2_lazy.sh diarizen_shared_wavlm_counting_pruned_att
 """
 
 def init(_run, experiment_dir=None):

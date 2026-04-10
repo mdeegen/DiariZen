@@ -71,6 +71,11 @@ def diarize_session(
     out_dir=None
 ):
     print('Extracting segmentations...')
+    if not os.path.exists(in_wav):
+        # in_wav = in_wav.replace("/mnt/matylda3/ihan/project/diarization/", "prefix_new/")
+        # in_wav = re.sub(r"^/mnt/[^/]+/*.wav", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/wavs/test/", in_wav)
+        in_wav = os.path.join("/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/wavs/test/", os.path.basename(in_wav))
+        # '/mnt/matylda3/ihan/project/diarization/dataset/NOTSOFAR1/multi-channel/wavs/test/S32000107.wav'
     waveform, sample_rate = torchaudio.load(in_wav)
     # TODO: Comment this line for MC signals in ifnerence
     # waveform = torch.unsqueeze(waveform[0], 0)      # force to use the SDM data
@@ -200,7 +205,7 @@ if __name__ == "__main__":
         type=str,
         default="Loss",
         help="validation metric",
-        choices=["Loss", "DER"],
+        choices=["Loss", "DER", "F1score", "DE0_Rov"],
     )
     parser.add_argument(
         "--val_mode",
@@ -321,7 +326,11 @@ if __name__ == "__main__":
     segmentation = args.segmentation_model
     if args.val_metric_summary:
         val_metric_lst = load_metric_summary(args.val_metric_summary, ckpt_path)
-        val_metric_lst_sorted = sorted(val_metric_lst, key=lambda i: i[args.val_metric])
+        metric = args.val_metric
+        if metric == "F1score":
+            val_metric_lst_sorted = sorted(val_metric_lst, key=lambda i: i[metric], reverse=True)
+        else:
+            val_metric_lst_sorted = sorted(val_metric_lst, key=lambda i: i[metric])
         best_val_metric_idx = val_metric_lst.index(val_metric_lst_sorted[0])
         if args.val_mode == "best":
             segmentation = val_metric_lst_sorted[:args.avg_ckpt_num]

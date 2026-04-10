@@ -4,22 +4,26 @@ from pathlib import Path
 
 
 BATCHFILE_TEMPLATE_EVAL = """#!/bin/bash
-#SBATCH -t 50:00:00          # time limit hrs:min:sec
+#SBATCH -t 10:00:00          # time limit hrs:min:sec
 #SBATCH -A hpc-prf-nt2
 #SBATCH -p gpu
 #SBATCH --output {nickname}_eval_%j.out
 #SBATCH --error {nickname}_eval_%j.err
 #SBATCH -J {nickname}_eval
 #SBATCH --gres=gpu:a100:4            # 4 GPU
-#SBATCH --mem=350G               # entspricht mem_free
+#SBATCH --mem=450G               # entspricht mem_free
 #SBATCH --ntasks=1          # slurm und accelerate get into conflict => slurm =1
 
-#SBATCH --cpus-per-task=16          # 4 CPUs per GPU 
+#SBATCH --cpus-per-task=16          # 4 CPUs per GPU
 
 
 cd /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_gcc
-srun bash run_stage_noctua2_lazy.sh n2_gcpsd_encoder_test
+srun bash run_stage_noctua2_lazy.sh wavlm_counting_pruned_81112
 """
+# srun bash run_stage_noctua2_lazy.sh wavlm_counting_pruned_att
+# srun bash run_stage_noctua2_lazy_ckpts.sh wavlm_counting_first
+# srun bash run_stage_noctua2_lazy_eval_csd.sh wavlm_counting_pruned_att
+
 
 def init(_run, experiment_dir=None):
     #

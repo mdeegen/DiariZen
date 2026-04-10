@@ -25,7 +25,7 @@ validation_interval = 1
 freeze_wavlm = false
 lr_decay = false
 use_one_cycle_lr = false
-validation_before_training = false # true       # activate validation activate validation activate validation activate validation
+validation_before_training = true # true       # activate validation activate validation activate validation activate validation
 preheat_epochs = 0
 
 [optimizer_small]
@@ -76,10 +76,10 @@ channel_mode = "multichannel"
 
 [train_dataset.dataloader]
 batch_size = 16
-num_workers = 2  # increase data loaders for gcc computation? instead maybe more prefatch
+num_workers = 3  # increase data loaders for gcc computation? instead maybe more prefatch
 drop_last = true
 pin_memory = true
-prefetch_factor = 2
+prefetch_factor = 3
 #persistent_workers = true
 
 [validate_dataset]
@@ -101,9 +101,9 @@ channel_mode = "multichannel"
 
 [validate_dataset.dataloader]
 batch_size = 16
-num_workers = 2
+num_workers = 3
 drop_last = true
 pin_memory = true
-prefetch_factor = 2
+prefetch_factor = 3
 #persistent_workers = true
 
