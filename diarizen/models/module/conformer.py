@@ -7,12 +7,11 @@ import torch.nn.functional as F
 from einops import rearrange
 import numpy as np
 
-
 def init_as_identity(linear, noisy=False):
     with torch.no_grad():
         if not noisy:
             linear.weight.zero_()
-            linear.bias.zero_()s
+            linear.bias.zero_()
             size = min(linear.in_features, linear.out_features)
             linear.weight[:size, :size] = torch.eye(size)
         else:
