@@ -8,6 +8,7 @@ import itertools
 import toml
 
 import numpy as np
+import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
@@ -73,13 +74,21 @@ def run(config, resume):
     #     | config["optimizer_big"]["args"]
     #     | {"lr": config["optimizer_big"]["args"]["lr"]},
     # )
-
-    optimizer_small = instantiate(
-        config["optimizer_small"]["path"],
-        args={"params": model.wavlm_model.parameters()}
-        | config["optimizer_small"]["args"]
-        | {"lr": config["optimizer_small"]["args"]["lr"]},
-    )
+    if config["finetune"]["freeze_wavlm"]:
+        dummy_param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+        optimizer_small = instantiate(
+            config["optimizer_small"]["path"],
+            args={"params": [dummy_param]}
+                 | config["optimizer_small"]["args"]
+                 | {"lr": config["optimizer_small"]["args"]["lr"]},
+        )
+    else:
+        optimizer_small = instantiate(
+            config["optimizer_small"]["path"],
+            args={"params": model.wavlm_model.parameters()}
+            | config["optimizer_small"]["args"]
+            | {"lr": config["optimizer_small"]["args"]["lr"]},
+        )
     optimizer_big = instantiate(
         config["optimizer_big"]["path"],
         args={"params": model.non_wavlm_parameters()}
