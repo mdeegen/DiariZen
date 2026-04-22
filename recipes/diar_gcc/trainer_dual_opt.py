@@ -561,7 +561,7 @@ class Trainer(BaseTrainer):
                 multilabel = self.unwrap_model.powerset.to_multilabel(y_pred)
                 permutated_target, _ = permutate(multilabel, target)
                 permutated_target_powerset = self.unwrap_model.powerset.to_powerset(
-                    permutated_target.float
+                    permutated_target.float()
                 )
                 loss = nll_loss(y_pred,
                                 torch.argmax(permutated_target_powerset, dim=-1)

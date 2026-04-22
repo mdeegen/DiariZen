@@ -8,15 +8,20 @@ ulimit -n 2048
 
 # general setup
 stage=2
+resume_flag=""  # default: no resume training
 
 recipe_root=/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc
 export exp_root=$recipe_root/exp
 conf_dir=$recipe_root/conf
 
+#TODO: resume logik umgekehrt für running experiments => Done 19.03
+if [ $# -ge 2 ] && [ "$2" == "-r" ]; then
+    resume_flag="-R"
+fi
 
 # training setup
 use_dual_opt=true  # true for wavlm_updated_conformer.toml; false for the others
-export train_conf=$conf_dir/spk_count_linear_noisy_to_gcpsd_encoder_ffn_film_all_layers_finetune.toml # gcc_encoder_precomputed  baseline_sc_debug.toml   #    mc_wavlm_updated_conformer.toml #MC
+export train_conf="$conf_dir/${1}.toml" # gcc_encoder_precomputed  baseline_sc_debug.toml   #    mc_wavlm_updated_conformer.toml #MC
 # spk_count_linear_noisy_to_gcpsd_encoder_ffn_film_deep_finetune2
 # spk_count_linear_noisy_to_gcpsd_encoder_ffn_film_all_layers_finetune
 # spk_count_linear_prob_gcpsd  spk_count_linear_noisy_to_gcpsd_ffn_frozen_median spk_count_linear_noisy_to_gcpsd_ffn_film_all layers spk_count_linear_noisy_to_gcpsd_encoder_ffn_film_deep
@@ -70,11 +75,11 @@ if [ $stage -le 1 ]; then
         echo "stage1: use dual-opt for model training..."
         source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1,2,3" accelerate launch \
             --num_processes 4 --main_process_port 1137 \
-            run_dual_opt_mc.py -C $train_conf -M train
-#############            ### Debugguing: use only one GPU and worker
-##        source /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0" accelerate launch \
+            run_dual_opt_mc_lazy.py -C $train_conf -M train $resume_flag
+##################            ### Debugguing: use only one GPU and worker
+#        source /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0" accelerate launch \
 #            --num_processes 1 --main_process_port 1134 \
-#            run_dual_opt_mc.py -C $train_conf -M train
+#            run_dual_opt_mc_lazy.py -C $train_conf -M train $resume_flag
     fi
 fi
 
@@ -93,11 +98,12 @@ if [ $stage -le 2 ]; then
     echo "stage2: model inference..."
 #    export CUDA_VISIBLE_DEVICES=5
 
-    train_log=`du -h $diarization_dir/*.log | sort -rh | head -n 1 | awk '{print $NF}'`
-    cat $train_log | grep 'Loss/DER' | awk -F ']:' '{print $NF}' > $diarization_dir/val_metric_summary.lst
+#    train_log=`du -h $diarization_dir/*.log | sort -rh | head -n 1 | awk '{print $NF}'`
+#    cat $train_log | grep 'Loss/DER' | awk -F ']:' '{print $NF}' > $diarization_dir/val_metric_summary.lst
 
-    for dset in  AliMeeting AMI AISHELL4 ; do # NOTSOFAR1
-#        # conda activate diarizen && python infer_avg_mc.py -C $config_dir \ ### CHiME7
+    for dset in   AMI AISHELL4 ; do # NOTSOFAR1 AliMeeting
+        echo "Inference on $dset..."
+        # conda activate diarizen && python infer_avg_mc.py -C $config_dir \ ### CHiME7
         source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && python infer_avg_oracle.py -C $config_dir \
             -i ${data_dir}/${dtype}/${dset}/wav.scp \
             -o ${diarization_dir}/infer$infer_affix/metric_${val_metric}_${val_mode}/avg_ckpt${avg_ckpt_num}/${dtype}/${dset} \

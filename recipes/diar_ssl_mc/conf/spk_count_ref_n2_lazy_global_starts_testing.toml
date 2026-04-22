@@ -8,7 +8,7 @@ avg_ckpt_num = 1
 #ckpt_dir = "/mnt/matylda3/ihan/project/diarization/huggingface_hub/diarizen-wavlm-base-s80-md/pytorch_model.bin"
 #ckpt_dir = "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc/exp/spk_count_linear_noisy_to_gcpsd_encoder_ffn_film_all_layers/checkpoints/best/pytorch_model.bin"
 ckpt_dir = "/scratch/hpc-prf-nt2/deegen/merlin/wavlm_pruned/diarizen-wavlm-base-s80-md/pytorch_model.bin"  # nocuta2
-load_wavlm_only = false
+load_wavlm_only = false  #?
 
 [trainer]
 path = "trainer_dual_opt.Trainer"
@@ -79,7 +79,8 @@ pin_memory = true
 prefetch_factor = 7
 
 [validate_dataset]
-path = "dataset.DiarizationDataset"
+#path = "dataset.DiarizationDataset"
+path = "dataset_lazy.DiarizationLazy"
 [validate_dataset.args]
 load_gcc_dir = "base" # "/mnt/scratch/tmp/qdeegen/AMI_AIS_ALI_NSF_CHiME7/data/gccs/standard_gcc/"
 subset = "dev"  # "train"  # "dev"

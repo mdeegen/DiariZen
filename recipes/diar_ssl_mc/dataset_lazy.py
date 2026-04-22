@@ -53,13 +53,18 @@ def load_scp(scp_file: str) -> Dict[str, str]:
     lines = [line.strip().split(None, 1) for line in open(scp_file)]
     return {x[0]: x[1] for x in lines}
 
-def load_uem(uem_file: str) -> Dict[str, float]:
+def load_uem(uem_file: str, filter=None) -> Dict[str, float]:
     """ returns dictionary { recid: duration }  """
     if not os.path.exists(uem_file):
         return None
     lines = [line.strip().split() for line in open(uem_file)]
-    return {x[0]: [float(x[-2]), float(x[-1])] for x in lines}
-    
+    if filter is None:
+        return {x[0]: [float(x[-2]), float(x[-1])] for x in lines}
+    elif filter == "ami":
+        return {x[0]: [float(x[-2]), float(x[-1])] for x in lines if str(x[0]).startswith("E") or str(x[0]).startswith("T") or str(x[0]).startswith("I")}
+    else:
+        assert False, "Wrong filter conditions"
+
 def _gen_chunk_indices(
     init_posi: int,
     data_len: int,
@@ -95,7 +100,7 @@ def _gen_segment_indices(
         yield start, end
         start += int(step)
 
-def _collate_fn(batch, max_speakers_per_chunk=4, gcpsd=False, only_waveform=False) -> torch.Tensor:
+def _collate_fn(batch, max_speakers_per_chunk=4, gcpsd=False, only_waveform=False, bf=False) -> torch.Tensor:
     collated_x = []
     collated_y = []
     collated_names = []
@@ -112,7 +117,10 @@ def _collate_fn(batch, max_speakers_per_chunk=4, gcpsd=False, only_waveform=Fals
     for b in batch:
         # print("Example ID:", f"recording_{b['rec']}_{b['start']}", flush=True)
         id = f"{b['name']}_{b['start']}"
-        x = b['data']#.to(accelerator.device)
+        if bf:
+            x = b['data_bf']
+        else:
+            x = b['data']  # .to(accelerator.device)
         y = b['mask_label']#.to(accelerator.device)
         name = b['name'][0]
         if not only_waveform:
@@ -256,6 +264,8 @@ class DiarizationLazy:
             only_wav=False,
             batch_size=16,
             shuffle = True,
+            beamformit = False,
+            filter = None,
     ):
         self.chunk_indices = []
         self.subset = subset
@@ -266,6 +276,7 @@ class DiarizationLazy:
         self.segment_size = segment_size
         self.segment_overlap = segment_overlap
         self.only_wav = only_wav
+        self.beamformit = beamformit
 
         self.sample_rate = sample_rate
         self.chunk_sample_size = sample_rate * chunk_size
@@ -279,7 +290,7 @@ class DiarizationLazy:
         self.model_num_frames = model_num_frames
 
         self.rec_scp = load_scp(scp_file)
-        self.reco2dur = load_uem(uem_file)
+        self.reco2dur = load_uem(uem_file, filter=filter)
         self.load_gcc_dir = load_gcc_dir
         self.num_channels = num_channels
         self.num_spk = num_spk
@@ -661,6 +672,9 @@ class DiarizationLazy:
             end_samples = int(end * self.sample_rate)
             rec_len = end- start
             data, sample_rate = sf.read(path, start=start_samples, stop=end_samples)
+            if self.beamformit:
+                path_bfit = path.replace("/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/wavs", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/bf")
+                data_bf_it, sample_rate = sf.read(path_bfit, start=start_samples, stop=end_samples)
         except Exception as e:
             print(f"Error reading {path} from {start} to {end}: {e}")
             raise RuntimeError(f"Error reading {path} from {start} to {end}: {e}")
@@ -670,6 +684,11 @@ class DiarizationLazy:
             data = data.reshape(1, -1)
         else:
             data = np.einsum('tc->ct', data)
+        if self.beamformit:
+            if data_bf_it.ndim == 1:
+                data_bf_it = data_bf_it.reshape(1, -1)
+            else:
+                data_bf_it = np.einsum('tc->ct', data_bf_it)
         # p(data.shape)
         assert data.shape[-1] <= rec_len * self.sample_rate, f"Data length mismatch: {data.shape[-1]} != {rec_len * self.sample_rate}, {path}, {start}, {end}"
         data = data[self.get_mic_selection(Path(path).stem), :]
@@ -690,6 +709,8 @@ class DiarizationLazy:
                     "start": start + st,
                     "end": start + ed,
                     "data": data[:, int(st*self.sample_rate):int(ed*self.sample_rate)],
+                    "data_bf": data_bf_it[0, int(st*self.sample_rate):int(ed*self.sample_rate)] if self.beamformit else None,
+
                 })
                 self.counter = self.counter + 1
 
@@ -857,7 +878,14 @@ class DiarizationLazy:
             data_pad = self.pad_data(data, size=fft_size)
             sigs_stft = pb.transform.stft(data_pad[0], size=fft_size, shift=320,
                                           pad=False, fading=False)
-            magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max])  # (frames, freq))
+            if self.beamformit:
+                data_pad_bf = self.pad_data(example["data_bf"][None], size=fft_size)
+                sigs_stft_bf = pb.transform.stft(data_pad_bf[0], size=fft_size, shift=320,
+                                              pad=False, fading=False)
+                magnitude = torch.from_numpy(np.abs(sigs_stft_bf)[:, k_min:k_max])  # (frames, freq))
+            else:
+                magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max])  # (frames, freq))
+
             gcc_features = self.compute_gcc(data_pad, frame_size_gcc=fft_size, frame_shift_gcc=320, f_max_gcc=fmax,
                                             f_min=fmin,
                                             apply_ifft=apply_ifft)
@@ -878,7 +906,13 @@ class DiarizationLazy:
             data_pad = self.pad_data(data, size=fft_size)
             sigs_stft = pb.transform.stft(data_pad[0], size=fft_size, shift=320,
                                           pad=False, fading=False)
-            magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max])  # (frames, freq))
+            if self.beamformit:
+                data_pad_bf = self.pad_data(example["data_bf"], size=fft_size)
+                sigs_stft_bf = pb.transform.stft(data_pad_bf[0], size=fft_size, shift=320,
+                                              pad=False, fading=False)
+                magnitude = torch.from_numpy(np.abs(sigs_stft_bf)[:, k_min:k_max])  # (frames, freq))
+            else:
+                magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max])  # (frames, freq))
 
 
             gcc_features = self.compute_gcc(data_pad, frame_size_gcc=fft_size, frame_shift_gcc=320, f_max_gcc=fmax,
@@ -901,6 +935,7 @@ class DiarizationLazy:
         else:
             return {
                 "data": ex["data"],
+                "data_bf": ex["data_bf"],
                 "mask_label": ex["mask_label"],
                 "name": ex["rec"],
                 "gcc_features": ex["gcc_features"],
@@ -1298,4 +1333,4 @@ class DiarizationLazy:
     # filtered_lazy = filtered_lazy.map(self.get_spatial_features)
     # self.lazy = filtered_lazy.map(self.to_dict)
     #
-    # self.lazy = IterableWrapper(self.lazy, len=world * len(rec_list))
+

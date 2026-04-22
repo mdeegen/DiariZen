@@ -22,6 +22,8 @@ from pyannote.audio.utils.signal import Binarize
 
 from diarizen.ckpt_utils import load_metric_summary
 
+print("improts done", flush=True)
+
 def oracle_HA_per_window(ann, hyp_segmentations, shift=0.1):
     """ann - pyannote.annotation, hyp_segmentations - EEND output, shift of local EEND windows"""
     frame_res = 0.020  # seconds
@@ -68,14 +70,16 @@ def diarize_session(
     min_speakers=1,
     max_speakers=20,
     apply_median_filtering=True,
-    out_dir=None
+    out_dir=None,
+    only_waveforms=False,
+    bf=False,
 ):
     print('Extracting segmentations...')
     waveform, sample_rate = torchaudio.load(in_wav)
     # TODO: Comment this line for MC signals in ifnerence
     # waveform = torch.unsqueeze(waveform[0], 0)      # force to use the SDM data
     segmentations = pipeline.get_segmentations({"waveform": waveform, "sample_rate": sample_rate},
-                                               soft=False, path=in_wav, out_dir=out_dir)
+                                               soft=False, path=in_wav, out_dir=out_dir, only_waveforms=only_waveforms, bf=bf)
 
     if apply_median_filtering:
         segmentations.data = median_filter(segmentations.data, size=(1, 11, 1), mode='reflect')
@@ -383,8 +387,11 @@ if __name__ == "__main__":
     Path(args.out_dir).mkdir(exist_ok=True, parents=True)
     audio_dict = load_scp(args.in_wav_scp)
 
+    bf = config["train_dataset"]["args"].get("beamformit", False)
+    only_waveforms = config["trainer"]["args"].get("only_waveforms", False)
     for sess, in_wav in audio_dict.items():
         print(f"Diarizing Session: {sess}", flush=True)
+
         diar_result = diarize_session(
             sess_name=sess,
             rttm_file=args.rttm_file,
@@ -393,7 +400,9 @@ if __name__ == "__main__":
             min_speakers=args.min_speakers,
             max_speakers=args.max_speakers,
             apply_median_filtering=args.apply_median_filtering,
-            out_dir=args.out_dir
+            out_dir=args.out_dir,
+            only_waveforms=only_waveforms,
+            bf=bf,
         )
         rttm_out = os.path.join(args.out_dir, sess + ".rttm")
         with open(rttm_out, "w") as f:

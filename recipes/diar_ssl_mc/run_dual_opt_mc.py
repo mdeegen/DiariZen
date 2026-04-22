@@ -43,17 +43,17 @@ def run(config, resume):
         load_wav = config["finetune"].get("load_wavlm_only", False)
         chkp_dir_clean_labels = config["finetune"].get("chkp_dir_clean_labels", None)
         load_der_encoder = config["finetune"].get("load_der_encoder", False)
-        dont_load_wavlm = config["finetune"].get("dont_load_wavlm", False)
+        # dont_load_wavlm = config["finetune"].get("dont_load_wavlm", False)
 
         if chkp_dir_clean_labels is not None:
             accelerator.print(f'Fine-tuning from a model trained with labels: {chkp_dir_clean_labels}')
             model = average_ckpt(chkp_dir_clean_labels, model, avg_ckpt_num=config["finetune"]["avg_ckpt_num"],
                                  load_wavlm_only=load_wav, load_encoder=load_encoder, load_spk_counting=config["finetune"]["load_spk_counting"],
-                                 load_der_encoder=load_der_encoder, dont_load_wavlm=dont_load_wavlm)
+                                 load_der_encoder=load_der_encoder, ) #dont_load_wavlm=dont_load_wavlm)
         else:
             model = average_ckpt(config["finetune"]["ckpt_dir"], model, avg_ckpt_num=config["finetune"]["avg_ckpt_num"],
                                  load_wavlm_only=load_wav, load_encoder=load_encoder, load_spk_counting=config["finetune"].get("load_spk_counting", None),
-                                 load_der_encoder=load_der_encoder, dont_load_wavlm=dont_load_wavlm)
+                                 load_der_encoder=load_der_encoder,) # dont_load_wavlm=dont_load_wavlm)
 
     # optimizer_small = instantiate(
     #     config["optimizer_small"]["path"],

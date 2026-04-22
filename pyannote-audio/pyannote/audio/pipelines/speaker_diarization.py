@@ -207,7 +207,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
     def CACHED_SEGMENTATION(self):
         return "training_cache/segmentation"
 
-    def get_segmentations(self, file, path, hook=None, soft=False, out_dir=None) -> SlidingWindowFeature:
+    def get_segmentations(self, file, path, hook=None, soft=False, out_dir=None, only_waveforms=False, bf=False) -> SlidingWindowFeature:
         """Apply segmentation model
 
         Parameter
@@ -223,7 +223,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         if hook is not None:
             hook = functools.partial(hook, "segmentation", None)
 
-        segmentations: SlidingWindowFeature = self._segmentation(file, path, hook=hook, soft=soft, out_dir=out_dir)
+        segmentations: SlidingWindowFeature = self._segmentation(file, path, hook=hook, soft=soft, out_dir=out_dir, only_waveforms=only_waveforms, bf=bf)
         return segmentations
 
     def get_embeddings(

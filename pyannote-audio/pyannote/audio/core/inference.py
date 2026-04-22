@@ -30,6 +30,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 from einops import rearrange
 # from masterarbeit.diarization_project.diarization_project.utils import num_spk
 from paderbox.io import load_json
@@ -489,7 +490,10 @@ class Inference(BaseInference):
 
         with torch.inference_mode():
             try:
-                outputs = self.model(chunks.to(self.device), gccs.to(self.device))
+                if gccs is None:
+                    outputs = self.model(chunks.to(self.device))
+                else:
+                    outputs = self.model(chunks.to(self.device), gccs.to(self.device))
                 if spk_accuracy:
                     return outputs
             except RuntimeError as exception:
@@ -527,7 +531,9 @@ class Inference(BaseInference):
         hook: Optional[Callable],
         path,
         soft: bool = False,
-        out_dir=None
+        out_dir=None,
+        only_waveforms=False,
+        waveform_bf=None,
     ) -> Union[SlidingWindowFeature, Tuple[SlidingWindowFeature]]:
         """Slide model on a waveform
 
@@ -578,7 +584,11 @@ class Inference(BaseInference):
             num_chunks, _, _ = chunks.shape
         else:
             num_chunks = 0
-
+        if waveform_bf is not None:
+            chunks_bf: torch.Tensor = rearrange(
+                waveform_bf.unfold(1, window_size, step_size),
+                "channel chunk frame -> chunk channel frame",
+            )
         # prepare last incomplete chunk
         has_last_chunk = (num_samples < window_size) or (
                 num_samples - window_size
@@ -589,6 +599,9 @@ class Inference(BaseInference):
             _, last_window_size = last_chunk.shape
             last_pad = window_size - last_window_size
             last_chunk = F.pad(last_chunk, (0, last_pad))
+            if waveform_bf is not None:
+                last_chunk_bf: torch.Tensor = waveform_bf[:, num_chunks * step_size :]
+                last_chunk_bf = F.pad(last_chunk_bf, (0, last_pad))
 
         def __empty_list(**kwargs):
             return list()
@@ -627,45 +640,57 @@ class Inference(BaseInference):
         for c in np.arange(0, num_chunks, self.batch_size):
             # c = c + 5 * self.batch_size
             batch: torch.Tensor = chunks[c : c + self.batch_size]
+
+            if waveform_bf is not None:
+                batch_bf: torch.Tensor = chunks_bf[c : c + self.batch_size, 0]
             num_spks = []
 
-            for i in range(batch.shape[0]):
-                chunk_start, chunk_end = self.get_chunk_start_end(c, i , self.step, self.duration)
-                num_spk = self.load_num_spk(annotations_session, chunk_start, chunk_end)
-                num_spks.append(num_spk)
+            if not only_waveforms:
+                for i in range(batch.shape[0]):
+                    chunk_start, chunk_end = self.get_chunk_start_end(c, i , self.step, self.duration)
+                    num_spk = self.load_num_spk(annotations_session, chunk_start, chunk_end)
+                    num_spks.append(num_spk)
 
-            num_spks = torch.from_numpy(np.stack(num_spks).astype(np.float32)).float().to(self.device)
-            # TODO get gcc features
-            # gccs = self.get_chunk_gccs(file_stem, c, batch_size=batch.shape[0], gcc_features=gcc_features)
-            gccs = []
-            fmin = 125
-            fmax = 3500
-            fft_size = 1024
-            median = "max"  #  False
-            kernel_size = 9     ## 9 for ffn and 25 for 9Layer
-            spk_accuracy = False
-            apply_ifft = False
-            k_min = int(np.round(fmin / (sample_rate / 2) * (fft_size // 2 + 1)))
-            k_max = int(np.round(fmax / (sample_rate / 2) * (fft_size // 2 + 1)))
-            for i in range(batch.shape[0]):
-                data = batch[i]
-                data = pad_data(data, size=fft_size)
+                num_spks = torch.from_numpy(np.stack(num_spks).astype(np.float32)).float().to(self.device)
+                # TODO get gcc features
+                # gccs = self.get_chunk_gccs(file_stem, c, batch_size=batch.shape[0], gcc_features=gcc_features)
+                gccs = []
+                fmin = 125
+                fmax = 3500
+                fft_size = 1024
+                median = "max"  #  False
+                kernel_size = 9     ## 9 for ffn and 25 for 9Layer
+                spk_accuracy = False
+                apply_ifft = False
+                k_min = int(np.round(fmin / (sample_rate / 2) * (fft_size // 2 + 1)))
+                k_max = int(np.round(fmax / (sample_rate / 2) * (fft_size // 2 + 1)))
+                for i in range(batch.shape[0]):
+                    data = batch[i]
+                    data = pad_data(data, size=fft_size)
 
-                sigs_stft = pb.transform.stft(data[0], size=fft_size, shift=320,
-                                              pad=False, fading=False)
-                magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max]).to(self.device)  # (frames, freq))
+                    sigs_stft = pb.transform.stft(data[0], size=fft_size, shift=320,
+                                                  pad=False, fading=False)
+                    magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max]).to(self.device)  # (frames, freq))
+                    # TODO MC mics bei 2. system fehlt weil pfad vorne getauscht
+                    mics = self.get_mic_selection(rec=file_stem)
+                    # print(data.shape, mics, session)
 
-                mics = self.get_mic_selection(rec=file_stem)
-                # print(data.shape, mics, session)
+                    gcc_features = self.compute_gcc(data[mics], frame_size_gcc=fft_size, frame_shift_gcc=320, f_max_gcc=fmax,
+                                                    f_min=fmin, apply_ifft=apply_ifft)
 
-                gcc_features = self.compute_gcc(data[mics], frame_size_gcc=fft_size, frame_shift_gcc=320, f_max_gcc=fmax,
-                                                f_min=fmin, apply_ifft=apply_ifft)
+                    gccs.append(torch.concat([gcc_features, magnitude[:, None, :]], dim=1))
 
-                gccs.append(torch.concat([gcc_features, magnitude[:, None, :]], dim=1))
-
-            gccs = torch.stack(gccs, dim=0).to(torch.complex64)
-            # gccs = num_spks
-            batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch, gccs, soft=soft, spk_accuracy=spk_accuracy)
+                gccs = torch.stack(gccs, dim=0).to(torch.complex64)
+                # gccs = num_spks
+                if waveform_bf is not None:
+                    batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch_bf, gccs=gccs, soft=soft, spk_accuracy=spk_accuracy)
+                else:
+                    batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch, gccs=gccs, soft=soft, spk_accuracy=spk_accuracy)
+            else:
+                if waveform_bf is not None:
+                    batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch_bf, gccs=None, soft=soft, spk_accuracy=False)
+                else:
+                    batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch, gccs=None, soft=soft, spk_accuracy=False)
 
             # print(num_spks.shape, batch_outputs.shape)
             # if spk_accuracy:
@@ -718,9 +743,18 @@ class Inference(BaseInference):
             # num_spks = torch.from_numpy(num_spks.astype(np.float32)).float().to(self.device)
             # # TODO: ground truth then comment next line out
             # # gccs = num_spks
-            gccs = gccs[-1]
+            if not only_waveforms:
+                gccs = gccs[-1]
+                if waveform_bf is not None:
+                    last_outputs = self.infer(last_chunk_bf[0][None], gccs[None], soft=soft, spk_accuracy=False)
+                else:
+                    last_outputs = self.infer(last_chunk[None], gccs[None], soft=soft, spk_accuracy=False)
+            else:
+                if waveform_bf is not None:
+                    last_outputs = self.infer(last_chunk_bf[0][None], gccs=None, soft=soft, spk_accuracy=False)
+                else:
+                    last_outputs = self.infer(last_chunk[None], gccs=None, soft=soft, spk_accuracy=False)
 
-            last_outputs = self.infer(last_chunk[None], gccs[None], soft=soft, spk_accuracy=spk_accuracy)
             # if spk_accuracy:
             #     # for spk_gt, pred in zip(num_spks, last_outputs):
             #         # pred_labels = torch.argmax(pred, dim=-1)
@@ -840,7 +874,7 @@ class Inference(BaseInference):
         )
 
     def __call__(
-        self, file: AudioFile, path, hook: Optional[Callable] = None, soft: bool = False, out_dir=None
+        self, file: AudioFile, path, hook: Optional[Callable] = None, soft: bool = False, out_dir=None, only_waveforms=False, bf=False,
     ) -> Union[
         Tuple[Union[SlidingWindowFeature, np.ndarray]],
         Union[SlidingWindowFeature, np.ndarray],
@@ -868,9 +902,14 @@ class Inference(BaseInference):
         fix_reproducibility(self.device)
 
         waveform, sample_rate = self.model.audio(file)
-
+        if bf:
+            path_bf = path.replace("/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/wavs",
+                                    "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/bf")
+            waveform_bf, sample_rate = torchaudio.load(path_bf)
+        else:
+            waveform_bf = None
         if self.window == "sliding":
-            return self.slide(waveform, sample_rate, path=path, hook=hook, soft=soft, out_dir=out_dir)
+            return self.slide(waveform, sample_rate, path=path, hook=hook, soft=soft, out_dir=out_dir, only_waveforms=only_waveforms, waveform_bf=waveform_bf)
 
         outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(waveform[None], soft=soft)
 

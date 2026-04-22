@@ -73,8 +73,10 @@ def run(config, resume):
     #     args={"params": model.channel_fusion_parameters()}
     #     | config["optimizer_big"]["args"]
     #     | {"lr": config["optimizer_big"]["args"]["lr"]},
-    # )
-    if config["finetune"]["freeze_wavlm"]:
+    # # )
+    freeze_wavlm = config["finetune"].get("freeze_wavlm", False)
+
+    if freeze_wavlm:
         dummy_param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
         optimizer_small = instantiate(
             config["optimizer_small"]["path"],
@@ -116,7 +118,8 @@ def run(config, resume):
         # noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
         # noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
         gcpsd=config["meta"].get("gcpsd", False),
-        only_waveform=config["train_dataset"]["args"].get("only_wav", False)
+        only_waveform=config["train_dataset"]["args"].get("only_wav", False),
+        bf=config["train_dataset"]["args"].get("beamformit", False),
     )
     _collate_fn_non_lazy_partial = partial(
         _collate_fn_non_lazy,
@@ -129,52 +132,60 @@ def run(config, resume):
 
     # accelerator.state.use_distributed_sampler = False
     if "train" in args.mode:
-        train_dataset_config["acc"] = accelerator
-        train_dataset_config["num_workers"] = config["train_dataset"]["dataloader"]["num_workers"]
-        train_dataset_config["batch_size"] = config["train_dataset"]["dataloader"].get("batch_size", 16),
-        train_dataset_config["gradient_accumulation_steps"] = config["trainer"]["args"]["gradient_accumulation_steps"]
-        train_dataset = instantiate(config["train_dataset"]["path"], args=train_dataset_config).lazy
+        if "lazy" in config["train_dataset"]["path"]:
+            train_dataset_config["acc"] = accelerator
+            train_dataset_config["num_workers"] = config["train_dataset"]["dataloader"]["num_workers"]
+            train_dataset_config["batch_size"] = config["train_dataset"]["dataloader"].get("batch_size", 16),
+            train_dataset_config["gradient_accumulation_steps"] = config["trainer"]["args"]["gradient_accumulation_steps"]
+            train_dataset = instantiate(config["train_dataset"]["path"], args=train_dataset_config).lazy
 
-        # import itertools
-        # starting = 1999 * 16  # 2000 batches skipped
-        # train_dataset2 = itertools.islice(train_dataset, starting, None)
-        #
-        # class IterableWrapper(IterableDataset):
-        #     def __init__(self, dataset, len=None):
-        #         self.dataset = dataset
-        #         self.get_my_length = len
-        #
-        #     def __iter__(self):
-        #         return iter(self.dataset)
-        #
-        #     def get_my_length(self):
-        #         # if self._len is not None:
-        #         return self.get_my_length
-        #         # return len(self.dataset)
-        #
-        #     def __len__(self):
-        #         return self.get_my_length
-        #
-        # train_dataset = IterableWrapper(train_dataset2, len=len(train_dataset) - starting) # world *
-        # train_dataloader = SizedIterator(train_dataset2, max(0, len(train_dataset) - starting))
-        # train_dataset = itertools.islice(train_dataset, 100, None)
+            # import itertools
+            # starting = 1999 * 16  # 2000 batches skipped
+            # train_dataset2 = itertools.islice(train_dataset, starting, None)
+            #
+            # class IterableWrapper(IterableDataset):
+            #     def __init__(self, dataset, len=None):
+            #         self.dataset = dataset
+            #         self.get_my_length = len
+            #
+            #     def __iter__(self):
+            #         return iter(self.dataset)
+            #
+            #     def get_my_length(self):
+            #         # if self._len is not None:
+            #         return self.get_my_length
+            #         # return len(self.dataset)
+            #
+            #     def __len__(self):
+            #         return self.get_my_length
+            #
+            # train_dataset = IterableWrapper(train_dataset2, len=len(train_dataset) - starting) # world *
+            # train_dataloader = SizedIterator(train_dataset2, max(0, len(train_dataset) - starting))
+            # train_dataset = itertools.islice(train_dataset, 100, None)
 
-        # train_dataset = IterableWrapper(train_dataset)
-        # acc = accelerator
-        # world = acc.num_processes
-        # rank = acc.process_index
-        #
-        # lazy = train_dataset.lazy.filter(lambda _, i: i % world == rank)
-        # train_dataset = apply_mappings(train_dataset, lazy)
-        # print("Wrapper length:", len(train_dataset))
-        train_dataloader = DataLoader(
-            dataset=train_dataset, collate_fn=collate_fn_partial, shuffle=False,  **config["train_dataset"]["dataloader"]  # sampler=None,
-        )
+            # train_dataset = IterableWrapper(train_dataset)
+            # acc = accelerator
+            # world = acc.num_processes
+            # rank = acc.process_index
+            #
+            # lazy = train_dataset.lazy.filter(lambda _, i: i % world == rank)
+            # train_dataset = apply_mappings(train_dataset, lazy)
+            # print("Wrapper length:", len(train_dataset))
+            train_dataloader = DataLoader(
+                dataset=train_dataset, collate_fn=collate_fn_partial, shuffle=False,  **config["train_dataset"]["dataloader"]  # sampler=None,
+            )
 
-        # train_dataloader = accelerator.prepare(train_dataloader)
-        # print(type(train_dataloader))
+            # train_dataloader = accelerator.prepare(train_dataloader)
+            # print(type(train_dataloader))
 
-        # print("After prepare length:", len(train_dataset))
+            # print("After prepare length:", len(train_dataset))
+        else:
+            train_dataset = instantiate(config["train_dataset"]["path"], args=train_dataset_config)
+            train_dataloader = DataLoader(
+                dataset=train_dataset, collate_fn=_collate_fn_non_lazy_partial, shuffle=False,
+                **config["train_dataset"]["dataloader"]
+            )
+            train_dataloader = accelerator.prepare(train_dataloader)
 
     if "train" in args.mode or "validate" in args.mode:
         # TODO: dev doch nicht lokal shufflen
