@@ -101,7 +101,7 @@ if [ $stage -le 2 ]; then
 #    train_log=`du -h $diarization_dir/*.log | sort -rh | head -n 1 | awk '{print $NF}'`
 #    cat $train_log | grep 'Loss/DER' | awk -F ']:' '{print $NF}' > $diarization_dir/val_metric_summary.lst
 
-    for dset in   AMI AISHELL4 ; do # NOTSOFAR1 AliMeeting
+    for dset in  NOTSOFAR1 AliMeeting AMI AISHELL4 ; do
         echo "Inference on $dset..."
         # conda activate diarizen && python infer_avg_mc.py -C $config_dir \ ### CHiME7
         source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && python infer_avg_oracle.py -C $config_dir \

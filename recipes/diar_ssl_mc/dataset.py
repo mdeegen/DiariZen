@@ -174,9 +174,11 @@ class DiarizationDataset(Dataset):
         num_spk = False,
         modelbased = False,
         gcpsd = False,
+        beamformit = False,
     ):
         self.chunk_indices = []
         self.subset = subset
+        self.beamformit = beamformit
 
         self.sample_rate = sample_rate
         self.chunk_sample_size = sample_rate * chunk_size
@@ -328,7 +330,11 @@ class DiarizationDataset(Dataset):
             # path = path.replace("/mnt/*/AMI_AIS_ALI_NSF_CHiME7",
             #                     "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7")
             path = re.sub(r"^/mnt/[^/]+/AMI_AIS_ALI_NSF_CHiME7", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7", path)
-
+        if not os.path.exists(path):
+            # IF not on noctua try on NT network
+            path = re.sub(r"/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7", "/net/vol/deegen/db/AMI_AIS_ALI_NSF_CHiME7", path)
+        if self.beamformit:
+            path = path.replace("/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/wavs", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/bf")
         try:
             data, sample_rate = sf.read(path, start=start, stop=end)
         except Exception as e:
@@ -339,7 +345,7 @@ class DiarizationDataset(Dataset):
         if data.ndim == 1:
             data = data.reshape(1, -1)
         else:
-            data = np.einsum('tc->ct', data) 
+            data = np.einsum('tc->ct', data)
 
         if self.channel_mode == "sdm":
             return np.expand_dims(data[0, :], 0)
@@ -348,6 +354,8 @@ class DiarizationDataset(Dataset):
             return np.expand_dims(data[channel_idx, :], 0)
         elif self.channel_mode == "average":
             return np.mean(data, 0, keepdims=True)
+        elif self.beamformit:
+            return data[0]
         elif self.channel_mode == "multichannel":
             # if num_channels >= 1:
                 # current_channels = data.shape[0]
@@ -411,10 +419,11 @@ class DiarizationDataset(Dataset):
             session, path, chunk_start, chunk_end = self.chunk_indices[idx]
 
             data = self.extract_wavforms(path, chunk_start, chunk_end, num_channels=self.num_channels)          # [start, end)
-            if data.shape[1] == self.chunk_sample_size:
-                break
-            if data.shape[1] < self.chunk_sample_size:   # mainly for CHiME6
-                idx = random.randint(0, len(self.chunk_indices) - 1)
+            if not self.beamformit:
+                if data.shape[1] == self.chunk_sample_size:
+                    break
+                if data.shape[1] < self.chunk_sample_size:   # mainly for CHiME6
+                    idx = random.randint(0, len(self.chunk_indices) - 1)
 
         # chunked annotations
         session_idx = self.get_session_idx(session)

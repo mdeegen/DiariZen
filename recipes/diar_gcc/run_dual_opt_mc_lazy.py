@@ -83,24 +83,27 @@ def run(config, resume):
     )
 
     spk_count_loss = config["trainer"]["args"].get("spk_count_loss", False)
+    only_waveform = config["trainer"]["args"].get("only_waveform", False)
     # pass model receptive field info to dataset
     train_dataset_config = config["train_dataset"]["args"]
     train_dataset_config["model_num_frames"] = model_num_frames
     train_dataset_config["model_rf_duration"] = model_rf_duration
     train_dataset_config["model_rf_step"] = model_rf_step
     train_dataset_config["spk_count_loss"] = spk_count_loss
+    train_dataset_config["only_waveform"] = only_waveform
 
     validate_dataset_config = config["validate_dataset"]["args"]
     validate_dataset_config["model_num_frames"] = model_num_frames
     validate_dataset_config["model_rf_duration"] = model_rf_duration
     validate_dataset_config["model_rf_step"] = model_rf_step
     validate_dataset_config["spk_count_loss"] = spk_count_loss
+    validate_dataset_config["only_waveform"] = only_waveform
 
     collate_fn_partial = partial(
         _collate_fn,
         max_speakers_per_chunk=config["model"]["args"]["max_speakers_per_chunk"],
         gcpsd=config["meta"].get("gcpsd", False),
-        only_waveform=spk_count_loss,
+        only_waveform=only_waveform,
     )
     _collate_fn_non_lazy_partial = partial(
         _collate_fn_non_lazy,

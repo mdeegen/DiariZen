@@ -135,6 +135,10 @@ def average_ckpt(ckpt_dir, model, val_metric='Loss', avg_ckpt_num=5, val_mode="b
             missing, unexpected = model.load_state_dict(ckpt_loaded, strict=False)
             print("Missing Keys at model.load :", missing, flush=True)
             print("Unexpected Keys at model.load :", unexpected, flush=True)
+            #Checkpoint top-level modules (6): ['classifier', 'conformer', 'lnorm', 'proj', 'wavlm_model', 'weight_sum']
+            # Loaded top-level modules (6): ['classifier', 'conformer', 'lnorm', 'proj', 'wavlm_model', 'weight_sum']
+            # Loaded parameter keys: 381 / 381 => CONFORMER UND CLASSIFIER WIRD MIT GELADEN
+
 
         if load_encoder is not None:
             print("Loading encoder from:", load_encoder, flush=True)

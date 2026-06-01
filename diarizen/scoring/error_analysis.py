@@ -344,8 +344,8 @@ der_metric = DiarizationErrorRate(collar=0.0, skip_overlap=False)
 
 
 frame_hop = 0.01
-ov = True
-single = False
+ov = False
+single = True
 silence = False
 for dset in ["AMI", "NOTSOFAR1", "AliMeeting", "AISHELL4"]:
     spectral_dir = f"/home/deegen/n3/deploy/forschung/DiariZen/recipes/diar_ssl_mc/exp/spk_count_ref/infer_oracle_clustering/metric_Loss_best/avg_ckpt5/test_marc_debug/{dset}"
@@ -531,7 +531,7 @@ for dset in ["AMI", "NOTSOFAR1", "AliMeeting", "AISHELL4"]:
         print("Both-diff-type ratio:", diff_total["both_diff_type_ratio"])
         print("Spatial advantage ratio:", diff_total["spatial_advantage_ratio"])
 
-    pb.io.dump_json(results, f"/home/deegen/forschung/DiariZen/error_analysis/average/error_counts_ov_{dset}.json")
+    pb.io.dump_json(results, f"/home/deegen/forschung/DiariZen/error_analysis/average/error_counts_single_{dset}.json")
 
         # ALLE
     # Cluster in EN2002a: 161

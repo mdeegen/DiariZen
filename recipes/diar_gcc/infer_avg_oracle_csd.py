@@ -1,6 +1,7 @@
 # Licensed under the MIT license.
 # Adopted from https://github.com/espnet/espnet/blob/master/egs2/chime8_task1/diar_asr1/local/pyannote_diarize.py
 # Copyright 2024 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
+import math
 import os
 import argparse
 import toml
@@ -10,6 +11,7 @@ from typing import Dict
 import torch
 import numpy as np
 import torchaudio
+import paderbox as pb
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -20,6 +22,7 @@ from sklearn.metrics import confusion_matrix, f1_score, recall_score, precision_
 
 # from pyannote.database.util import load_rttm
 from pyannote.metrics.segmentation import Annotation, Segment
+from diarizen.spatial_features.gcc_phat import get_gcc_for_all_channel_pairs_torch
 # from pyannote.audio.pipelines import SpeakerDiarization as SpeakerDiarizationPipeline
 # from pyannote.audio.utils.signal import Binarize
 
@@ -313,6 +316,47 @@ def compute_correct_predictions(target_spk_count, y_pred):
 
     return all_preds, all_targets, num_correct, num_total, num_correct_ov, num_total_ov, total_active
 
+
+def get_mic_selection(rec):
+    if rec.startswith(("S3")):
+        mics = [1, 3, 4, 6]  # for NSF
+    else:
+        mics = [0, 2, 4, 6]  # default
+    return mics
+
+def compute_gcc(waveforms_mc, frame_size_gcc=1024, frame_shift_gcc=320, avg_len_gcc=4,
+                search_range_gcc=10, f_max_gcc=3500, f_min=125, apply_ifft=True, device=None):
+    """
+    Compute GCC features from multichannel waveforms.
+    returns:
+        batch_gcc_features: (batch, frame, channel, channel, search_range)
+    """
+    # TODO: try different stft values for better gcc but need fit frames of WAVLM
+    sigs_stft = pb.transform.stft(waveforms_mc, frame_size_gcc, frame_shift_gcc,
+                                  pad=False, fading=False)
+    sigs_stft = torch.from_numpy(sigs_stft).to(device)
+    gcc_features = get_gcc_for_all_channel_pairs_torch(sigs_stft, f_min=f_min, f_max=f_max_gcc,apply_ifft=apply_ifft)
+    return gcc_features
+
+def num_frames(L, n_fft, hop):
+    return math.floor((L - n_fft) / hop) + 1
+
+def pad_data(data, size=1024):
+    L = data.shape[-1]
+    n_fft_wavlm = 400
+    hop = 320
+    N_ref = num_frames(L, n_fft_wavlm, hop)
+
+    n_fft_big = size
+    N_big = num_frames(L, n_fft_big, hop)
+
+    L_target = (N_ref - 1) * hop + n_fft_big
+    pad = max(0, L_target - L)
+
+    last_vals = data[:, -1:]  # Shape (C,1)
+    pad_block = np.repeat(last_vals, pad, axis=-1)  # Shape (C,pad)
+    return np.concatenate([data, pad_block], axis=-1)
+
 def diarize_session(
     sess_name,
     rttm_file,
@@ -324,6 +368,7 @@ def diarize_session(
     out_dir=None,
     model=None,
     scp=None,
+    spatial = False,
 ):
     all_preds = []
     all_targets = []
@@ -352,11 +397,56 @@ def diarize_session(
     for start_sample in range(0, num_samples, chunk_size):
         end_sample = min(start_sample + chunk_size, num_samples)
 
-        chunk = waveform[0, start_sample:end_sample]  # (channels, samples)
+        chunk = waveform[:, start_sample:end_sample]  # (channels, samples)
         # Pad last chunk if shorter than chunk_size
-        if chunk.shape[0] < chunk_size:
-            pad_size = chunk_size - chunk.shape[0]
+        if chunk.shape[-1] < chunk_size:
+            pad_size = chunk_size - chunk.shape[-1]
             chunk = torch.nn.functional.pad(chunk, (0, pad_size))
+
+
+
+
+        # TODO GCC features
+        if spatial:
+            # for i in range(batch.shape[0]):
+            #     chunk_start, chunk_end = self.get_chunk_start_end(c, i, self.step, self.duration)
+            #     num_spk = self.load_num_spk(annotations_session, chunk_start, chunk_end)
+            #     num_spks.append(num_spk)
+            #
+            # num_spks = torch.from_numpy(np.stack(num_spks).astype(np.float32)).float().to(self.device)
+            # # TODO get gcc features
+            # gccs = self.get_chunk_gccs(file_stem, c, batch_size=batch.shape[0], gcc_features=gcc_features)
+            gccs = []
+            fmin = 125
+            fmax = 3500
+            fft_size = 1024
+            # median = "max"  # False
+            # kernel_size = 9  ## 9 for ffn and 25 for 9Layer
+            # spk_accuracy = False
+            apply_ifft = False
+            k_min = int(np.round(fmin / (sample_rate / 2) * (fft_size // 2 + 1)))
+            k_max = int(np.round(fmax / (sample_rate / 2) * (fft_size // 2 + 1)))
+            # for i in range(batch.shape[0]):
+            data = chunk.detach().cpu().numpy()
+            data = pad_data(data, size=fft_size)
+
+            sigs_stft = pb.transform.stft(data[0], size=fft_size, shift=320,
+                                          pad=False, fading=False)
+            magnitude = torch.from_numpy(np.abs(sigs_stft)[:, k_min:k_max]).to(device)  # (frames, freq))
+            # TODO MC mics bei 2. system fehlt weil pfad vorne getauscht
+            mics = get_mic_selection(rec=sess_name)
+            # print(data.shape, mics, session)
+
+            gcc_features = compute_gcc(data[mics], frame_size_gcc=fft_size, frame_shift_gcc=320,
+                                            f_max_gcc=fmax,
+                                            f_min=fmin, apply_ifft=apply_ifft, device=device)
+
+            gccs = torch.concat([gcc_features, magnitude[:, None, :]], dim=1).to(torch.complex64)  # (frames, channel+1, freq)
+
+            # gccs = torch.stack(gccs, dim=0).to(torch.complex64)
+        else:
+            gccs = None
+            chunk = chunk[0]
 
         # Chunk time in seconds (RTTM is in seconds)
         chunk_start_sec = start_sample / float(sample_rate)
@@ -371,7 +461,10 @@ def diarize_session(
         # target_spk_count = torch.clamp(target_spk_count, min=0, max=max_num_spk - 1)
 
         with torch.no_grad():
-            prediction = model(chunk[None])
+            if gccs is None:
+                prediction = model(chunk[None])
+            else:
+                prediction = model(chunk[None], gccs[None])
         # TODO: model frame auflösung zu samples bzw sekunden damit auf ground truth mappen kann? oder truth in frames holen?
         # TODO: pro chunk eval oder am ende einmal? Aber F1Score, recall etc alles speichern
         preds, targets, num_correct_tmp, num_total_tmp, num_correct_ov_tmp, num_total_ov_tmp, total_active_tmp = compute_correct_predictions(torch.as_tensor(target_spk_count.astype(np.int64), device=prediction.device), prediction)
@@ -632,6 +725,7 @@ if __name__ == "__main__":
     state_dict = torch.load(best_ckp, map_location="cpu")
 
     model = instantiate(config['model']["path"], args=config['model']["args"])
+    spatial = config["trainer"]["args"].get("spatial", False)
 
     model.load_state_dict(state_dict, strict=True)
     model.to(device)
@@ -649,6 +743,7 @@ if __name__ == "__main__":
             out_dir=Path(args.out_dir) / f"{sess}",
             model = model,
             scp=args.in_wav_scp,
+            spatial=spatial,
         )
 
     preds = []
