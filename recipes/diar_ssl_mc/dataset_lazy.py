@@ -673,7 +673,8 @@ class DiarizationLazy:
             rec_len = end- start
             data, sample_rate = sf.read(path, start=start_samples, stop=end_samples)
             if self.beamformit:
-                path_bfit = path.replace("/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/wavs", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/bf")
+                #path_bfit = path.replace("/net/vol/ameise/data/dipco/eval/", "/net/vol/ameise/data/dipco_bfit/eval/")
+                path_bfit = path
                 data_bf_it, sample_rate = sf.read(path_bfit, start=start_samples, stop=end_samples)
         except Exception as e:
             print(f"Error reading {path} from {start} to {end}: {e}")
@@ -691,7 +692,8 @@ class DiarizationLazy:
                 data_bf_it = np.einsum('tc->ct', data_bf_it)
         # p(data.shape)
         assert data.shape[-1] <= rec_len * self.sample_rate, f"Data length mismatch: {data.shape[-1]} != {rec_len * self.sample_rate}, {path}, {start}, {end}"
-        data = data[self.get_mic_selection(Path(path).stem), :]
+        if data.shape[0] > 1:
+            data = data[self.get_mic_selection(Path(path).stem), :]
         # generate chunks for this sub_recording
         # if end - start < self.chunk_size+2 :
         #     print(f"{self.rank} Sub-recording too short for chunking: {rec}, {start}, {end}, length: {end - start}", flush=True)
@@ -947,6 +949,7 @@ class DiarizationLazy:
         convert session to session idex
         """
         session_keys = list(self.rec_scp.keys())
+        #print(session, session_keys)
         return session_keys.index(session)
 
 
@@ -1035,6 +1038,11 @@ class DiarizationLazy:
     def get_mic_selection(self, rec):
         if rec.startswith(("S3")):
             mics = [1, 3, 4, 6]  # for NSF
+        elif rec.startswith(("dipco")):
+            #mics = [0, 2, 3, 5]  # for dipco
+            mics = [0, 2, 4, 6]  # for dipco as in CSPB benchmark
+        elif rec.startswith(("mmcsg")):
+            mics = [0, 2, 3, 4]  # for front mics
         else:
             mics = [0, 2, 4, 6]  # default
         return mics

@@ -520,6 +520,11 @@ class Inference(BaseInference):
     def get_mic_selection(self, rec):
         if rec.startswith(("S3")):
             mics = [1, 3, 4, 6]  # for NSF
+        elif rec.startswith(("dipco")):
+            #mics = [0, 2, 3, 5]  # for dipco
+            mics = [0, 2, 4, 6]  # for dipco as in CSPB benchmark
+        elif rec.startswith(("mmcsg")):
+            mics = [0, 2, 3, 4]  # for front mics
         else:
             mics = [0, 2, 4, 6]  # default
         return mics
@@ -628,9 +633,13 @@ class Inference(BaseInference):
         # frame_deltas = []
         rttm_file = "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc/data_mc/test/rttm"
         if not Path(rttm_file).exists():
-            rttm_file = "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc/data_no_chime/test/rttm"
+            #rttm_file = "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc/data_no_chime/test/rttm"
+            #rttm_file = "/home/ameise/Code/DiariZen/recipes/diar_ssl_mc/data_files/dipco/eval/rttm"
+            #rttm_file = "/home/ameise/Code/DiariZen/recipes/diar_ssl_mc/data_files/mmcsg/eval/rttm"
+            rttm_file = "/home/ameise/Code/DiariZen/recipes/diar_ssl_mc/data_files/all_eval_rttm"
 
         annotations_session = self.rttm2label(rttm_file, file_stem)
+        #print(annotations_session)
         # print(f"Sliding over {num_chunks} chunks of {self.duration:g}s each, ")
 
         # TODO: (Un-)comment to switch between loading precomputed GCCs and ground truth num spk

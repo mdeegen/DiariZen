@@ -100,6 +100,19 @@ def fix_keys(pretrained_state, old_prefix, new_prefix):
 def average_ckpt(ckpt_dir, model, val_metric='Loss', avg_ckpt_num=5, val_mode="best", load_wavlm_only=False,
                  load_encoder=None, load_spk_counting=False, load_der_encoder=False, csd=False):
 
+    if isinstance(load_der_encoder, bool) and load_der_encoder and os.path.isfile(ckpt_dir):
+        ckpt_loaded = torch.load(ckpt_dir, map_location=torch.device('cpu'))
+        if load_der_encoder:
+                print("\n\nLoaded encoder state dict\n\n")
+                partly_load(model.encoder, "encoder.", ckpt_loaded)
+
+        print("Model loaded successfully.")
+        return model
+
+
+
+
+
     # check if dir exists otherwise switch prefix to noctua2
     if not os.path.isdir(ckpt_dir):
         ckpt_dir = ckpt_dir.replace("/mnt/matylda3/ihan/project/diarization/huggingface_hub/", "/scratch/hpc-prf-nt2/deegen/merlin/wavlm_pruned/")
@@ -142,6 +155,7 @@ def average_ckpt(ckpt_dir, model, val_metric='Loss', avg_ckpt_num=5, val_mode="b
                 model.gcc_encoder.load_state_dict(ckpt_loaded_spk, strict=True)
             else:
                 model.encoder.load_state_dict(ckpt_loaded_spk, strict=True)
+                print("\n\nLoaded encoder state dict\n\n")
 
 
         print("Model loaded successfully.")
