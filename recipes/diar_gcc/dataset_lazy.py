@@ -270,6 +270,7 @@ class DiarizationLazy:
         num_workers=0,
         gradient_accumulation_steps=1,
         spk_count_loss=False,
+        only_waveform = False,
         batch_size=16,
         shuffle=True,
     ):
@@ -282,7 +283,7 @@ class DiarizationLazy:
         self.segment_size = segment_size
         self.segment_overlap = segment_overlap
         self.spk_count_loss = spk_count_loss
-
+        self.only_waveform = only_waveform
         self.sample_rate = sample_rate
         self.chunk_sample_size = sample_rate * chunk_size
         self.chunk_size = chunk_size
@@ -598,7 +599,7 @@ class DiarizationLazy:
         # #     print(f"Rank {self.rank}: Dataset length after unbatch: {count}", flush=True)
         #     print(f"Rank {self.rank} BERECHNETE LÄNGE", self._length, flush=True)
         filtered_lazy = filtered_lazy.map(self.get_chunk_labels)
-        if not self.spk_count_loss:
+        if not self.only_waveform:
             filtered_lazy = filtered_lazy.map(self.get_spatial_features)
         lazy = filtered_lazy.map(self.to_dict)
         if self.subset == "train" and not self.debug:
@@ -1023,7 +1024,7 @@ class DiarizationLazy:
 
     def to_dict(self, ex):
         # print(f"DDP Worker: {self.rank}", ex["rec"], flush=True)
-        if self.spk_count_loss:
+        if self.only_waveform:
             return {
                 "data": ex["data"],
                 "mask_label": ex["mask_label"],

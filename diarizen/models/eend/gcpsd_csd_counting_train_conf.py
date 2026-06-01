@@ -6,11 +6,15 @@
 
 
 import os
+
+import numpy as np
 import torch
 import torch.nn as nn
-
+import torch.profiler
 from functools import lru_cache
-from transformers import WavLMModel, Wav2Vec2FeatureExtractor
+import paderbox as pb
+# import dlp_mpi
+import time
 
 from pyannote.audio.core.model import Model as BaseModel
 from pyannote.audio.utils.receptive_field import (
@@ -19,9 +23,13 @@ from pyannote.audio.utils.receptive_field import (
     multi_conv_receptive_field_center
 )
 
-from diarizen.models.module.conformer import ConformerEncoder
+
+from diarizen.models.module.conformer import ConformerEncoder, gcc_encoder, init_as_identity
 from diarizen.models.module.wav2vec2.model import wav2vec2_model as wavlm_model
 from diarizen.models.module.wavlm_config import get_config
+from diarizen.spatial_features.gcc_phat import (get_gcc_for_all_channel_pairs, channel_wise_activities,
+                                                convert_to_frame_wise_activities, get_dominant_time_frequency_mask)
+
 
 class Model(BaseModel):
     def __init__(
@@ -30,6 +38,9 @@ class Model(BaseModel):
         wavlm_layer_num: int = 13,
         wavlm_feat_dim: int = 768,
         attention_in: int = 256,
+        linear_input_size: int = 399,  # number of frames per channel
+        linear_output_size: int = 399,  # number of frames per channel
+        num_head_aux: int = 4,
         ffn_hidden: int = 1024,
         num_head: int = 4,
         num_layer: int = 4,
@@ -37,36 +48,38 @@ class Model(BaseModel):
         dropout: float = 0.1,
         use_posi: bool = False,
         output_activate_function: str = False,
-        max_speakers_per_chunk: int = 4,
+        max_speakers_per_chunk: int = 3,
         chunk_size: int = 5,
         num_channels: int = 8,
         selected_channel: int = 0,
         sample_rate: int = 16000,
-        model_path = None,
+        random_channel = False,
+        max_num_spk = 4, # silence , 1 ,2 oder mehr als 2 spk
+        sin_cos = False,
+        ffn = None,
+        attention_in_aux = 216,
+        num_layer_aux = 3,
+        bce_loss = False,
+        num_powerset = 2,
     ):
+        if not num_powerset:
+            num_powerset = None
         super().__init__(
             num_channels=num_channels,
             duration=chunk_size,
-            max_speakers_per_chunk=max_speakers_per_chunk
+            max_speakers_per_chunk=max_speakers_per_chunk,
+            max_speakers_per_frame=num_powerset,
         )
-        
+        self.max_speakers_per_chunk = max_speakers_per_chunk
+        self.max_num_spk = max_speakers_per_chunk
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
         self.selected_channel = selected_channel
-        self.model_path = model_path
+        self.random_channel = random_channel
 
-        # wavlm 
-        if model_path is None:
-            self.wavlm_model = self.load_wavlm(wavlm_src)
-        else:
-            self.wavlm_model = WavLMModel.from_pretrained(
-                model_path,
-                output_hidden_states=True
-            )
-        self.weight_sum = nn.Linear(wavlm_layer_num, 1, bias=False)
 
-        self.proj = nn.Linear(wavlm_feat_dim, attention_in)
-        self.lnorm = nn.LayerNorm(attention_in)
+        self.proj_csd = nn.Linear(attention_in_aux, attention_in)
+        self.lnorm_csd = nn.LayerNorm(attention_in)
 
         self.conformer = ConformerEncoder(
             attention_in=attention_in,
@@ -78,17 +91,36 @@ class Model(BaseModel):
             use_posi=use_posi,
             output_activate_function=output_activate_function
         )
-
-        self.classifier = nn.Linear(attention_in, self.dimension)
-        self.activation = self.default_activation()
-
+        self.gcc_encoder = gcc_encoder(
+            attention_in_aux=attention_in_aux,  # search range for delay
+            linear_input_size=linear_input_size,  # number of frames per channel
+            linear_output_size=linear_output_size,  # number of frames per channel
+            num_head_aux=num_head_aux,
+            num_layer_aux=num_layer_aux,
+            dropout=dropout,
+            sin_cos = sin_cos,
+            ffn = ffn,
+            )
+        # if bce_loss:
+        #     self.classifier = nn.Linear(attention_in, max_speakers_per_chunk)
+        #     self.activation = self.default_activation()
+        # else:
+        # self.classifier_csd = nn.Linear(attention_in, self.dimension)
+        self.activation_csd = self.default_activation()
+        self.classifier_csd = nn.Sequential(
+            nn.Linear(attention_in, attention_in),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(attention_in, self.max_speakers_per_chunk)
+        )
     def non_wavlm_parameters(self):
         return [
-            *self.weight_sum.parameters(),
-            *self.proj.parameters(),
-            *self.lnorm.parameters(),
+            *self.proj_csd.parameters(),
+            *self.lnorm_csd.parameters(),
+            # TODO
             *self.conformer.parameters(),
-            *self.classifier.parameters(),
+            *self.gcc_encoder.parameters(),
+            *self.classifier_csd.parameters(),
         ]
 
     @property
@@ -181,9 +213,9 @@ class Model(BaseModel):
             padding=padding,
             dilation=dilation,
         )
-    
+
     @property
-    def get_rf_info(self):     
+    def get_rf_info(self):
         """Return receptive field info to dataset
         """
 
@@ -196,89 +228,31 @@ class Model(BaseModel):
         step=receptive_field_step / self.sample_rate
         return num_frames, duration, step
 
-    def load_wavlm(self, source: str):
-        """
-        Load a WavLM model from either a config name or a checkpoint file.
-
-        Parameters
-        ----------
-        source : str
-            - If `source` is a config name (e.g., "wavlm_large_md_s80"), 
-            the model will be initialized using predefined configuration via `get_config()`.
-            - If `source` is a file path (e.g., "pytorch_model.bin", "model.ckpt", or any local .pt file),
-            the model will be loaded from the checkpoint, using its saved 'config' and 'state_dict'.
-
-        Returns
-        -------
-        model : nn.Module
-            Initialized WavLM model.
-        """
-        if os.path.isfile(source):
-            # Load from checkpoint file
-            ckpt = torch.load(source, map_location="cpu")
-
-            if "config" not in ckpt or "state_dict" not in ckpt:
-                raise ValueError("Checkpoint must contain 'config' and 'state_dict'.")
-
-            for k, v in ckpt["config"].items():
-                if 'prune' in k and v is not False:
-                    raise ValueError(f"Pruning must be disabled. Found: {k}={v}")
-
-            model = wavlm_model(**ckpt["config"])
-            model.load_state_dict(ckpt["state_dict"], strict=False)
-
-        else:
-            # Load from predefined config
-            config = get_config(source)
-            model = wavlm_model(**config)
-
-        return model
-
-
-    def wav2wavlm(self, in_wav, model):
-        """
-        transform wav to wavlm features
-        """
-        layer_reps, _ = model.extract_features(in_wav)
-        return torch.stack(layer_reps, dim=-1)
-    
-    def forward(self, waveforms: torch.Tensor, num_spk=None) -> torch.Tensor:
+    def forward(self, waveforms: torch.Tensor, gcc_features: torch.Tensor) -> torch.Tensor:
         """Pass forward
 
         Parameters
         ----------
         waveforms : (batch, sample) or (batch, channel, sample)
-        num_spk : (batch, frames, 1)
+        gccs : (batch, frames, channels, delays)
 
         Returns
         -------
         scores : (batch, frame, classes)
         """
-        assert waveforms.dim() == 3, waveforms.shape
-        waveforms = waveforms[:, self.selected_channel, :]
+        # print("MODEL:", waveforms.shape, gcc_features.shape, flush=True)
+        # with torch.no_grad():
+        gcc_embeddings = self.gcc_encoder(gcc_features)
 
-        # wavlm_feat = self.wav2wavlm(waveforms, self.wavlm_model)
-        if self.model_path is None:
-            wavlm_feat = self.wav2wavlm(waveforms, self.wavlm_model)
-        else:
-            with torch.no_grad():
-                wavlm_feat = self.wavlm_model(waveforms)
-                hidden_states = wavlm_feat.hidden_states
-                wavlm_feat = torch.stack(hidden_states, dim=-1)  # (batch, frames, feat_dim, layers)
+        outputs = self.proj_csd(gcc_embeddings)
+        outputs = self.lnorm_csd(outputs)
 
-        wavlm_feat = self.weight_sum(wavlm_feat)
-        wavlm_feat = torch.squeeze(wavlm_feat, -1)
-
-        outputs = self.proj(wavlm_feat)
-        outputs = self.lnorm(outputs)
-        
         outputs = self.conformer(outputs)
 
-        outputs = self.classifier(outputs)
-        outputs = self.activation(outputs)
+        outputs = self.classifier_csd(outputs)
+        # outputs = self.activation(outputs)
 
         return outputs
-
 
 if __name__ == '__main__':
     wavlm_conf_name = 'wavlm_base_md_s80'

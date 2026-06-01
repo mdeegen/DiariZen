@@ -417,7 +417,7 @@ class Trainer(BaseTrainer):
             y_pred = self.model(xs, num_spk)
         elif self.num_spk_and_gcc:
             y_pred = self.model(gccs, num_spk)
-        elif self.spk_count_loss or self.only_waveforms:
+        elif (self.spk_count_loss or self.only_waveforms) and not self.spatial:
             y_pred = self.model(xs)
         else:
             y_pred = self.model(xs, gccs)
@@ -536,7 +536,7 @@ class Trainer(BaseTrainer):
             y_pred = self.model(xs, num_spk)
         elif self.num_spk_and_gcc:
             y_pred = self.model(gccs, num_spk)
-        elif self.spk_count_loss or self.only_waveforms:
+        elif (self.spk_count_loss or self.only_waveforms) and not self.spatial:
             y_pred = self.model(xs)
         else:
             y_pred = self.model(xs, gccs)

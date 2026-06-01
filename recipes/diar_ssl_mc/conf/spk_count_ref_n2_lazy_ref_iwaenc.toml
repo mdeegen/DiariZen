@@ -73,10 +73,10 @@ num_spk = true
 
 [train_dataset.dataloader]
 batch_size = 16
-num_workers = 1
+num_workers = 3
 drop_last = true
 pin_memory = true
-prefetch_factor = 7
+prefetch_factor = 3
 
 [validate_dataset]
 #path = "dataset.DiarizationDataset"
@@ -95,7 +95,7 @@ num_spk = true
 
 [validate_dataset.dataloader]
 batch_size = 16
-num_workers = 1
+num_workers = 3
 drop_last = true
 pin_memory = true
-prefetch_factor = 7
+prefetch_factor = 3

@@ -80,6 +80,7 @@ class Trainer:
         self.ov_loss = self.trainer_config.get("ov_loss", False)
         self.spk_count_loss = self.trainer_config.get("spk_count_loss", False)
         self.only_waveforms = self.trainer_config.get("only_waveforms", False)
+        self.spatial = self.trainer_config.get("spatial", False)
         self.bce_loss = self.trainer_config.get("bce_loss", False)
         self.aux_loss = self.trainer_config.get("aux_loss", False)
         self.debug = self.trainer_config.get("debug", False)
