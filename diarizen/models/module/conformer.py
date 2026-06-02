@@ -484,7 +484,9 @@ class ConformerEncoder_film(nn.Module):
 
         for layer, film_layer in zip(self.conformer_layer, self.film_layers):
             x = film_layer(x, num_spk)
+            # print("film", x.shape) #[16, 399, attention_in]
             x = layer(x, pos_k)
+            # print("layer", x.shape) #[16, 399, attention_in]
         if self.output_activate_function:
             x = self.activate_function(x)
         return x
@@ -1814,3 +1816,157 @@ class FiLM(nn.Module):
 #         if self.output_activate_function:
 #             x = self.activate_function(x)
 #         return x
+
+
+
+
+class BLSTM_FILM(nn.Module):
+    def __init__(
+            self,
+            input_size=768,
+            hidden_size: int = 512,
+            num_layers: int = 2,
+            film_dim=1,
+            attention_in: int = 256,
+    ) -> None:
+        super().__init__()
+
+        assert num_layers in [2, 3], "Currently only 2 or 3 layers supported for blstm"
+        if num_layers == 2:
+            self.blstm_layers = nn.ModuleList([
+                FiLM(attention_in, film_dim),
+                torch.nn.LSTM(input_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+                FiLM(2*hidden_size, film_dim),
+                torch.nn.LSTM(2*hidden_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+            ])
+        else:
+            self.blstm_layers = nn.ModuleList([
+            FiLM(attention_in, film_dim),
+            torch.nn.LSTM(input_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+            FiLM(2*hidden_size, film_dim),
+            torch.nn.LSTM(2*hidden_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+            FiLM(2*hidden_size, film_dim),
+            torch.nn.LSTM(2*hidden_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+        ])
+
+
+    def forward(self, x: torch.Tensor, num_spk) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor (#batch, time, idim).
+        """
+        hidden=None
+        for cnt, layer in enumerate(self.blstm_layers):
+            if cnt % 2 == 0:  # FiLM layer
+                x = layer(x, num_spk)
+                # print("film", x.shape) #first [16, 399, 768], then [16, 399, 1024]
+            else:
+                x, _ = layer(x) # No dedicated hidden initialization
+                # print("blstm", x.shape) [16, 399, 1024]
+        return x
+    
+
+
+class BLSTM(nn.Module):
+    def __init__(
+            self,
+            input_size=768,
+            hidden_size: int = 512,
+            num_layers: int = 2,
+    ) -> None:
+        super().__init__()
+
+        assert num_layers in [2, 3], "Currently only 2 or 3 layers supported for blstm"
+        if num_layers == 2:
+            self.blstm_layers = nn.ModuleList([
+                torch.nn.LSTM(input_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+                torch.nn.LSTM(2*hidden_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+            ])
+        else:
+            self.blstm_layers = nn.ModuleList([
+            torch.nn.LSTM(input_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+            torch.nn.LSTM(2*hidden_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+            torch.nn.LSTM(2*hidden_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
+        ])
+
+
+
+
+
+    def forward(self, x: torch.Tensor, num_spk) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor (#batch, time, idim).
+        """
+        for layer in self.blstm_layers:
+                x, _ = layer(x) # No dedicated hidden initialization
+                # print("blstm", x.shape) [16, 399, 1024]
+        return x
+    
+
+
+
+
+
+class BLSTM_torch(nn.Module):
+    _states = None
+    def __init__(
+            self,
+            input_size=768,
+            hidden_size: int = 512,
+            num_layers: int = 2,
+    ) -> None:
+        super().__init__()
+
+        assert num_layers == 2, "Currently only 2 supported for stateful blstm"
+
+        self.blstm = torch.nn.LSTM(input_size, hidden_size, num_layers=2, bidirectional=True, batch_first=True)
+    
+
+    def forward(self, x: torch.Tensor, num_spk) -> torch.Tensor:
+
+        x, _ = self.blstm(x)
+        return x
+
+
+
+
+class BLSTM_stateful(nn.Module):
+    _states = None
+    def __init__(
+            self,
+            input_size=768,
+            hidden_size: int = 512,
+            num_layers: int = 2,
+    ) -> None:
+        super().__init__()
+
+        assert num_layers == 2, "Currently only 2 supported for stateful blstm"
+
+        self.blstm = torch.nn.LSTM(input_size, hidden_size, num_layers=2, bidirectional=True, batch_first=True)
+
+
+    @property
+    def states(self):
+        return self._states
+
+    @states.deleter
+    def states(self):
+        self._states = None
+
+    @states.setter
+    def states(self, states):
+        self._states = states
+    
+
+    def forward(self, x: torch.Tensor, num_spk) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor (#batch, time, idim).
+        """
+        if self.states is not None and x.shape[1] != self.states[0].shape[1]: # new batch dimension does not match saved states
+            self.states = None
+        x, states = self.blstm(x, self.states)
+        self.states = states[0].detach(), states[1].detach()
+        # print("blstm", x.shape) [16, 399, 1024]
+        return x
