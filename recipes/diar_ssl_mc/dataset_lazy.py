@@ -673,7 +673,10 @@ class DiarizationLazy:
             rec_len = end- start
             data, sample_rate = sf.read(path, start=start_samples, stop=end_samples)
             if self.beamformit:
-                path_bfit = path.replace("/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/wavs", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/bf")
+                if path.startswith("/scratch"):
+                    path_bfit = path.replace("/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/wavs", "/scratch/hpc-prf-nt2/db/AMI_AIS_ALI_NSF_CHiME7/bf")
+                else:
+                    path_bfit = path
                 data_bf_it, sample_rate = sf.read(path_bfit, start=start_samples, stop=end_samples)
         except Exception as e:
             print(f"Error reading {path} from {start} to {end}: {e}")
@@ -695,7 +698,7 @@ class DiarizationLazy:
         # generate chunks for this sub_recording
         # if end - start < self.chunk_size+2 :
         #     print(f"{self.rank} Sub-recording too short for chunking: {rec}, {start}, {end}, length: {end - start}", flush=True)
-        if end - start >= self.chunk_size :   #  TODO: remove +2 and adjust the same in get_chunk_indices or find reason why chunks should be 2 seconds longer alwyys?
+        if end - start >= self.chunk_size:   #  TODO: remove +2 and adjust the same in get_chunk_indices or find reason why chunks should be 2 seconds longer alwyys?
             examples = []
             # TODO: start und end sind noch absolut, muss auf neue segmente bezogen werden!!
             for st, ed in _gen_chunk_indices(0, rec_len, self.chunk_size, self.chunk_shift):

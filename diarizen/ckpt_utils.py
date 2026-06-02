@@ -147,7 +147,6 @@ def average_ckpt(ckpt_dir, model, val_metric='Loss', avg_ckpt_num=5, val_mode="b
             else:
                 model.encoder.load_state_dict(ckpt_loaded_spk, strict=True)
 
-
         print("Model loaded successfully.")
         return model
 
