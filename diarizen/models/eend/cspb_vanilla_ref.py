@@ -43,6 +43,7 @@ class Model(BaseModel):
         selected_channel: int = 0,
         sample_rate: int = 16000,
         model_path = None,
+        hidden_size = 512,
         softmax = False,
         projection=False,
         layer_norm=False,
@@ -66,6 +67,8 @@ class Model(BaseModel):
                 model_path,
                 output_hidden_states=True
             )
+        self.wavlm_model.requires_grad_(False)
+        self.wavlm_model.eval()
 
         if softmax:
             self.apply_softmax_to_weights = True
@@ -74,17 +77,20 @@ class Model(BaseModel):
             self.apply_softmax_to_weights = False
             self.weight_sum = nn.Linear(wavlm_layer_num, 1, bias=False)
 
+        self.input_size = wavlm_feat_dim
         if projection:
             self.proj = nn.Linear(wavlm_feat_dim, attention_in)
-        self.projection = projection
-
+            self.input_size = attention_in
         if layer_norm:
-            self.lnorm = nn.LayerNorm(attention_in)
+            self.lnorm = nn.LayerNorm(self.input_size)
+
+        self.projection = projection
         self.layer_norm = layer_norm
+
 
         if downstream_model == 'conformer':
             self.downstream_model = ConformerEncoder(
-                attention_in=attention_in,
+                attention_in=self.input_size,
                 ffn_hidden=ffn_hidden,
                 num_head=num_head,
                 num_layer=num_layer,
@@ -93,19 +99,20 @@ class Model(BaseModel):
                 use_posi=use_posi,
                 output_activate_function=output_activate_function
             )
+            self.classifier = nn.Linear(self.input_size, self.dimension)
         elif downstream_model == 'blstm':
             self.downstream_model = BLSTMEncoder(
-                input_size=wavlm_feat_dim, # 768 for wavlm without projection, adapt with projection
-                hidden_size=512,
+                input_size=self.input_size, # 768 for wavlm without projection, adapt with projection
+                hidden_size=hidden_size,
                 num_layers=2,
                 dropout=dropout,
                 bidirectional=True,
                 batch_first=True,
             )
+            self.classifier = nn.Linear(2 * hidden_size, self.dimension)
         else:
             raise ValueError(f"Unsupported downstream model: {downstream_model}")
 
-        self.classifier = nn.Linear(attention_in, self.dimension)
         self.activation = self.default_activation()
 
     def non_wavlm_parameters(self):
@@ -238,6 +245,7 @@ class Model(BaseModel):
             self.receptive_field_size(num_frames=2) - receptive_field_size
         )
         num_frames = self.num_frames(self.chunk_size * self.sample_rate)
+        print(num_frames, self.chunk_size, self.sample_rate, receptive_field_size, receptive_field_step, flush=True)
         duration = receptive_field_size / self.sample_rate
         step=receptive_field_step / self.sample_rate
         return num_frames, duration, step
