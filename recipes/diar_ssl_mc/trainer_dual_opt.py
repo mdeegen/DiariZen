@@ -94,7 +94,7 @@ class Trainer(BaseTrainer):
         if len(self.grad_history) > self.gradient_history_size:
             self.grad_history.pop(0)
         clip_value = np.percentile(self.grad_history, self.gradient_percentile)
-        self.accelerator.clip_grad_norm_(model.parameters(), clip_value)  
+        self.accelerator.clip_grad_norm_(model.parameters(), clip_value)
 
     def training_step(self, batch, batch_idx):
         self.optimizer_small.zero_grad()

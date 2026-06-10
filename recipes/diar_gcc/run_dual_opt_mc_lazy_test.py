@@ -6,10 +6,10 @@ import argparse
 # import json
 from functools import partial
 from pathlib import Path
-
+import pickle
 # import numpy as np
 import toml
-import torch
+# import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from dataset import _collate_fn as _collate_fn_non_lazy
@@ -17,12 +17,42 @@ from dataset_lazy import IterableWrapper, _collate_fn
 # from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader
 
-from diarizen.ckpt_utils import average_ckpt
+# from diarizen.ckpt_utils import average_ckpt
 from diarizen.logger import init_logging_logger
 from diarizen.utils import instantiate
 
 
 def run(config, resume):
+
+    # exp_dir = "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_gcc/exp/test"
+    # combined_id_list = []
+    # total_read_length = 0
+    # total_read_length_set = 0
+    #
+    # for rank in [0, 1, 2, 3]:
+    #     stats_path = Path(exp_dir) / f"id_list_stats{rank}.txt"
+    #     id_list_path = Path(exp_dir) / f"id_list{rank}.pkl"
+    #
+    #     with stats_path.open("r", encoding="utf-8") as fh:
+    #         for line in fh:
+    #             if line.startswith("LISTE len(id_list):"):
+    #                 total_read_length += int(line.split(":", 1)[1].strip())
+    #             if line.startswith("SET"):
+    #                 total_read_length_set += int(line.split(":", 1)[1].strip())
+    #
+    #
+    #     with id_list_path.open("rb") as fh:
+    #         combined_id_list.extend(pickle.load(fh))
+    #
+    # print(
+    #     "COMBINED:", len(combined_id_list),
+    #     "\n SUM_READ_LENGTHS:", total_read_length,
+    #     "\n MATCH:", len(combined_id_list) == total_read_length,
+    #     "\n SET SHOULD BE LONG:", total_read_length_set,
+    #     "\n SET ist lang:", len(set(combined_id_list)),
+    #     flush=True,
+    # )
+    # assert False
     logger = init_logging_logger(config)
     # torch.set_num_threads(1)
     # torch.set_num_interop_threads(1)
@@ -39,49 +69,10 @@ def run(config, resume):
     # TODO: ACHTUNG! DEVICE SPECIFIC TRUE
     set_seed(config["meta"]["seed"]) # , device_specific=True)
 
-    model = instantiate(config["model"]["path"], args=config["model"]["args"])
-    model_num_frames, model_rf_duration, model_rf_step = model.get_rf_info
+    # model = instantiate(config["model"]["path"], args=config["model"]["args"])
+    model_num_frames, model_rf_duration, model_rf_step =  (399, 0.025, 0.02) # model.get_rf_info
+    # print("model_num_frames, model_rf_duration, model_rf_step = ",  model.get_rf_info)
 
-    if config["finetune"]["finetune"]:
-        load_encoder = config["finetune"].get("load_encoder", None)
-        csd = config["finetune"].get("csd", False)
-        load_wavlm_only = config["finetune"].get("load_wavlm_only", False)
-        accelerator.print("fine-tuning...")
-        model = average_ckpt(
-            config["finetune"]["ckpt_dir"],
-            model,
-            avg_ckpt_num=config["finetune"]["avg_ckpt_num"],
-            load_wavlm_only=load_wavlm_only,
-            load_encoder=load_encoder,
-            csd=csd,
-        )
-        print("Finetune loaded", flush=True)
-    dummy_param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-    # frozen_wavlm = config["model"]["args"].get("wavlm_frozen", True)
-    # if frozen_wavlm:
-    optimizer_small = instantiate(
-        config["optimizer_small"]["path"],
-        args={"params": [dummy_param]}
-        | config["optimizer_small"]["args"]
-        | {"lr": config["optimizer_small"]["args"]["lr"]},
-    )
-    # else:
-    #     optimizer_small = instantiate(
-    #         config["optimizer_small"]["path"],
-    #         args={"params": model.wavlm.parameters()}
-    #             | config["optimizer_small"]["args"]
-    #             | {"lr": config["optimizer_small"]["args"]["lr"]},
-    #     )
-    optimizer_big = instantiate(
-        config["optimizer_big"]["path"],
-        args={"params": model.non_wavlm_parameters()}
-        | config["optimizer_big"]["args"]
-        | {"lr": config["optimizer_big"]["args"]["lr"]},
-    )
-
-    (model, optimizer_small, optimizer_big) = accelerator.prepare(
-        model, optimizer_small, optimizer_big
-    )
 
     spk_count_loss = config["trainer"]["args"].get("spk_count_loss", False)
     only_waveform = config["trainer"]["args"].get("only_waveform", False)
@@ -105,6 +96,7 @@ def run(config, resume):
         max_speakers_per_chunk=config["model"]["args"]["max_speakers_per_chunk"],
         gcpsd=config["meta"].get("gcpsd", False),
         only_waveform=only_waveform,
+        debug=True,
     )
     _collate_fn_non_lazy_partial = partial(
         _collate_fn_non_lazy,
@@ -116,12 +108,21 @@ def run(config, resume):
     #     with open(sample_dir) as f:
     #         ov_labels = json.load(f)
     # accelerator.state.use_distributed_sampler = False
+
     if "train" in args.mode:
         train_dataset_config["acc"] = accelerator
-        train_dataset_config["num_workers"] = config["train_dataset"]["dataloader"]["num_workers"]
-        train_dataset_config["batch_size"] = (config["train_dataset"]["dataloader"].get("batch_size", 16),)
-        train_dataset_config["gradient_accumulation_steps"] = config["trainer"]["args"]["gradient_accumulation_steps"]
-        train_dataset = instantiate(config["train_dataset"]["path"], args=train_dataset_config).lazy
+        train_dataset_config["num_workers"] = config["train_dataset"]["dataloader"][
+            "num_workers"
+        ]
+        train_dataset_config["batch_size"] = (
+            config["train_dataset"]["dataloader"].get("batch_size", 16),
+        )
+        train_dataset_config["gradient_accumulation_steps"] = config["trainer"]["args"][
+            "gradient_accumulation_steps"
+        ]
+        train_dataset = instantiate(
+            config["train_dataset"]["path"], args=train_dataset_config
+        ).lazy
         # if train_dataset.lazy is not None:
         #     train_dataset = train_dataset.lazy
 
@@ -141,9 +142,15 @@ def run(config, resume):
         # TODO: dev doch nicht lokal shufflen? ist doch quasi egal für dev?
         if "lazy" in config["validate_dataset"]["path"]:
             validate_dataset_config["acc"] = accelerator
-            validate_dataset_config["num_workers"] = config["validate_dataset"]["dataloader"]["num_workers"]
-            validate_dataset_config["batch_size"] = (config["validate_dataset"]["dataloader"].get("batch_size", 16),)
-            validate_dataset = instantiate(config["validate_dataset"]["path"], args=validate_dataset_config).lazy
+            validate_dataset_config["num_workers"] = config["validate_dataset"][
+                "dataloader"
+            ]["num_workers"]
+            validate_dataset_config["batch_size"] = (
+                config["validate_dataset"]["dataloader"].get("batch_size", 16),
+            )
+            validate_dataset = instantiate(
+                config["validate_dataset"]["path"], args=validate_dataset_config
+            ).lazy
 
             validate_dataloader = DataLoader(
                 dataset=validate_dataset,
@@ -172,26 +179,76 @@ def run(config, resume):
     #     from diarizen.spatial_features.precompute import precompute_gccs
     #     precompute_gccs(config)
 
-    trainer = instantiate(config["trainer"]["path"], initialize=False)(
-        accelerator=accelerator,
-        config=config,
-        resume=resume,
-        model=model,
-        optimizer_small=optimizer_small,
-        optimizer_big=optimizer_big,
+    # TODO: TRainer weg schmeißen, acc komm checken ob trainer was macht und dann hier dataloader iterieren!
+    from tqdm.auto import tqdm
+    dataloader_bar = tqdm(
+        train_dataloader,
+        total=len(train_dataloader),
+        desc="Training debug",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{r_bar}",
+        colour="green",
+        disable=not accelerator.is_local_main_process,
+        position=0,
+        leave=True,
     )
+    id_list = []
+    for batch_idx, batch in enumerate(dataloader_bar):
+        id_list.extend(batch["ids"])
+        continue
 
-    for flag in args.mode:
-        if flag == "train":
-            try:
-                trainer.train(train_dataloader, validate_dataloader)
-            except Exception as e:
-                print(f"Training failed due to {e}.", flush=True)
-                raise e
-        elif flag == "validate":
-            trainer.validate(validate_dataloader)
-        else:
-            raise ValueError(f"Unknown mode: {flag}.")
+    print(
+        "LISTE:", len(id_list), "SET:", len(set(id_list)), flush=True
+    )
+    total = len(id_list)
+    unique = len(set(id_list))
+    exp_dir = "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_gcc/exp/test"
+    rank = accelerator.process_index
+    stats_path = Path(exp_dir) / f"id_list_stats{rank}.txt"
+    duplicates_path = Path(exp_dir) / f"id_list_duplicates{rank}.txt"
+    id_list_path = Path(exp_dir) / f"id_list{rank}.pkl"
+    duplicates_list_path = Path(exp_dir) / f"dublicates_list{rank}.pkl"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    with stats_path.open("w", encoding="utf-8") as fh:
+        fh.write(f"LISTE len(id_list): {total}\n")
+        fh.write(f"SET len(set(id_list)): {unique}\n")
+    logger.info(f"Saved id list stats to {stats_path.as_posix()}")
+
+    duplicates = [id for id in id_list if id_list.count(id) > 1]
+    unique_duplicates = sorted(duplicates)
+    # print("DUPLICATES:", unique_duplicates, "COUNT:", len(unique_duplicates), flush=True)
+    with duplicates_path.open("w", encoding="utf-8") as fh:
+        fh.write(f"unique_duplicates: {unique_duplicates}\n")
+        fh.write(f"COUNT:, len(unique_duplicates): {len(unique_duplicates)}\n")
+
+    with id_list_path.open("wb") as fh:
+        pickle.dump(id_list, fh)
+    logger.info(f"Saved id list to {id_list_path.as_posix()}")
+    with duplicates_list_path.open("wb") as fh:
+        pickle.dump(duplicates, fh)
+    logger.info(f"Saved id list to {duplicates_list_path.as_posix()}")
+
+    # trainer = instantiate(config["trainer"]["path"], initialize=False)(
+    #     accelerator=accelerator,
+    #     config=config,
+    #     resume=resume,
+    #     model=None,
+    #     optimizer_small=None,
+    #     optimizer_big=None,
+    #     debug_data=True,
+    # )
+
+    # for flag in args.mode:
+    #     if flag == "train":
+    #         try:
+    #             trainer.train(train_dataloader, validate_dataloader)
+    #         except Exception as e:
+    #             print(f"Training failed due to {e}.", flush=True)
+    #             raise e
+    #     elif flag == "validate":
+    #         trainer.validate(validate_dataloader)
+    #     else:
+    #         raise ValueError(f"Unknown mode: {flag}.")
 
 
 if __name__ == "__main__":

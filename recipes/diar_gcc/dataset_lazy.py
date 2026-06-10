@@ -18,14 +18,14 @@ from paderbox.io import dump_json, load_json
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from diarizen.spatial_features.gcc_phat import (
-    channel_wise_activities,
-    compute_vad_th,
-    convert_to_frame_wise_activities,
-    get_dominant_time_frequency_mask,
-    get_gcc_for_all_channel_pairs,
+    # channel_wise_activities,
+    # compute_vad_th,
+    # convert_to_frame_wise_activities,
+    # get_dominant_time_frequency_mask,
+    # get_gcc_for_all_channel_pairs,
     get_gcc_for_all_channel_pairs_torch,
 )
-from diarizen.spatial_features.segmentation import spatial_segmentation
+# from diarizen.spatial_features.segmentation import spatial_segmentation
 
 
 def get_dtype(value: int) -> str:
@@ -81,9 +81,7 @@ def _gen_chunk_indices(
     init_posi = int(init_posi)
     data_len = int(data_len)
     cur_len = data_len - init_posi
-    assert (
-        cur_len >= size
-    ), f"Data length {data_len} - {init_posi} too short for chunk size {size}."
+    assert (cur_len >= size), f"Data length {data_len} - {init_posi} too short for chunk size {size}."
     num_chunks = int((cur_len - size + step) / step)
 
     for i in range(num_chunks):
@@ -109,7 +107,7 @@ def _gen_segment_indices(
 
 
 def _collate_fn(
-    batch, max_speakers_per_chunk=4, gcpsd=False, only_waveform=False
+    batch, max_speakers_per_chunk=4, gcpsd=False, only_waveform=False, debug=False
 ) -> torch.Tensor:
     collated_x = []
     collated_y = []
@@ -164,6 +162,16 @@ def _collate_fn(
         gccs.append(gcc)
         num_spks.append(num_spk)
     # print(acc.process_index, collated_names[0], flush=True)
+    if debug:
+        return {
+            "xs": None,
+            "ts": torch.from_numpy(np.stack(collated_y)),
+            "ids": ids,
+            # 'names': collated_names,
+            # "names": {"items": collated_names},
+            "gccs": None,
+            "num_spks": None,
+        }
     if gcpsd:
         try:
             return {
@@ -273,12 +281,14 @@ class DiarizationLazy:
         only_waveform = False,
         batch_size=16,
         shuffle=True,
+        debug_data = False,
     ):
         self.chunk_indices = []
         self.subset = subset
         self.shuffle = shuffle
         self.buffer_size = buffer_size
         self.debug = debug
+        self.debug_data = debug_data
         self.sub_rec = sub_rec
         self.segment_size = segment_size
         self.segment_overlap = segment_overlap
@@ -317,6 +327,7 @@ class DiarizationLazy:
         self.world = acc.num_processes
         self.rank = acc.process_index
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.discarded = 0
         # else:
         #     world = 1
         #     rank = 0
@@ -336,9 +347,7 @@ class DiarizationLazy:
                     # print(end_sec - start_sec, flush=True)
                     if end_sec - start_sec >= chunk_size_tmp:
                         try:
-                            for st, ed in _gen_segment_indices(
-                                start_sec, end_sec, chunk_size_tmp, chunk_shift_tmp
-                            ):
+                            for st, ed in _gen_segment_indices(start_sec, end_sec, chunk_size_tmp, chunk_shift_tmp):
                                 chunk_indices.append((rec, (st, ed)))  # seconds
                                 # print(f'asdChunked {rec} from {st} to {ed}', flush=True)
                                 # durations[counter % world] += ed - st
@@ -347,9 +356,7 @@ class DiarizationLazy:
                         except Exception as e:
                             print(f"Un-matched recording: {rec}", e)
                     else:
-                        assert (
-                            end_sec - start_sec >= self.chunk_size
-                        ), f"Recording {rec} too short even for sub recording: {end_sec}, - {start_sec} <= {self.chunk_size}"
+                        assert (end_sec - start_sec >= self.chunk_size), f"Recording {rec} too short even for sub recording: {end_sec}, - {start_sec} <= {self.chunk_size}"
                         chunk_indices.append((rec, (start_sec, end_sec)))  # seconds
                         # durations[counter % world] += end_sec - start_sec
                         # counter +=1
@@ -357,13 +364,10 @@ class DiarizationLazy:
             else:
                 chunk_indices = self.reco2dur.items()
 
-            rec_list = [
-                (rec, dur)
-                for i, (rec, dur) in enumerate(chunk_indices)
-                if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)
-            ]  # List of (sub-) recordings, each as (rec, dur)
+            rec_list = [(rec, dur) for i, (rec, dur) in enumerate(chunk_indices) if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)]  # List of (sub-) recordings, each as (rec, dur)
+            # printe den seed von torch python etc
+            # Log seeds for reproducibility verification across ranks/workers
 
-            # TODO: Seed festlegen, damit reproduzierbar geshufflet wird
             if self.subset == "train":
                 random.shuffle(rec_list)
             # dataset_length = sum([
@@ -375,22 +379,15 @@ class DiarizationLazy:
             #     len(list(_gen_chunk_indices(0, dur[1] - dur[0], self.chunk_size, self.chunk_shift)))
             #     for rec, dur in rec_list
             # ])
-            dataset_length = sum(
-                [
-                    int(
-                        (dur[1] - dur[0] - self.chunk_size + self.chunk_shift)
-                        / self.chunk_shift
-                    )
-                    for rec, dur in rec_list
-                    if dur[1] - dur[0] >= self.chunk_size
-                ]
-            )
+            dataset_length = sum([
+                int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift)
+                for rec, dur in rec_list
+                if dur[1] - dur[0] >= self.chunk_size
+            ])
 
             lengths = [None] * self.world
             if self.world > 1:
-                torch.distributed.all_gather_object(
-                    lengths, dataset_length
-                )  # len(rec_list) ) #
+                torch.distributed.all_gather_object(lengths, dataset_length)  # len(rec_list) ) #
             else:
                 lengths = [dataset_length]
             self.max_len = max(lengths)
@@ -407,14 +404,47 @@ class DiarizationLazy:
 
             rec_list = self.extend_by_recording(rec_list, delta)
 
-            if self.subset == "train" and self.shuffle:
-                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
-                print("shuffled", flush=True)
+            #  commented out cause shuffle of workers made half the data go missing (filtering later on breaks down)
+            # if self.subset == "train" and self.shuffle:
+            #     filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
+            # else:
+            filtered_lazy = from_list(rec_list)
+            # filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
+            # filtered_lazy = filtered_lazy.unbatch()
+            if self.debug_data:
+                filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk_debug)
             else:
-                filtered_lazy = from_list(rec_list)
-            filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
+                filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
             filtered_lazy = filtered_lazy.unbatch()
 
+            # if self.debug_data:
+            #     # TODO: Test 1 vs 4 ranks und wie viel ankommt dass alles gleich ist und dann ok?
+            #     out_path = Path("/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_gcc/tmp") / f"dataset_info_rank_{self.subset}_{self.rank}.txt"
+            #
+            #     # Debug: Count examples after unbatch
+            #     print("Unbatching", flush=True)
+            #     count = 0
+            #     from tqdm import tqdm
+            #
+            #     for _ in tqdm(filtered_lazy, desc="Unbatching"):
+            #         count += 1
+            #     print(
+            #         f"Rank {self.rank}: Total examples after unbatch: {count}",
+            #         flush=True
+            #     )
+            #     info_lines = [
+            #         f"rank: {self.rank}",
+            #         f"world: {self.world}",
+            #         f"lengths_all_ranks: {lengths}",
+            #         f"max_len: {self.max_len}",
+            #         f"per_rank_after_padding: {self.max_len}",
+            #         f"total_after_padding: {self.max_len * self.world}",
+            #         f"total_batches: {self.max_len * self.world / self.batch_size}",
+            #         f"Rank {self.rank}: Total examples after unbatch: {count}",
+            #         f"discarded: {self.discarded}",
+            #     ]
+            #     with open(out_path, "w") as fh:
+            #         fh.write("\n".join(info_lines))
             # # shuffling
             # if self.subset == "train":
             #     filtered_lazy = filtered_lazy.shuffle(reshuffle=True) #  if self.subset == "train" else self.rec_list
@@ -467,9 +497,7 @@ class DiarizationLazy:
                     # print(end_sec - start_sec, flush=True)
                     if end_sec - start_sec >= chunk_size_tmp:
                         try:
-                            for st, ed in _gen_segment_indices(
-                                start_sec, end_sec, chunk_size_tmp, chunk_shift_tmp
-                            ):
+                            for st, ed in _gen_segment_indices(start_sec, end_sec, chunk_size_tmp, chunk_shift_tmp):
                                 chunk_indices.append((rec, (st, ed)))  # seconds
                                 # print(f'asdChunked {rec} from {st} to {ed}', flush=True)
                                 # durations[counter % world] += ed - st
@@ -478,9 +506,7 @@ class DiarizationLazy:
                         except Exception as e:
                             print(f"Un-matched recording: {rec}", e)
                     else:
-                        assert (
-                            end_sec - start_sec >= self.chunk_size
-                        ), f"Recording {rec} too short even for sub recording: {end_sec}, - {start_sec} <= {self.chunk_size}"
+                        assert (end_sec - start_sec >= self.chunk_size), f"Recording {rec} too short even for sub recording: {end_sec}, - {start_sec} <= {self.chunk_size}"
                         chunk_indices.append((rec, (start_sec, end_sec)))  # seconds
                         # durations[counter % world] += end_sec - start_sec
                         # counter +=1
@@ -488,11 +514,7 @@ class DiarizationLazy:
             else:
                 chunk_indices = self.reco2dur.items()
 
-            rec_list = [
-                (rec, dur)
-                for i, (rec, dur) in enumerate(chunk_indices)
-                if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)
-            ]  # List of (sub-) recordings, each as (rec, dur)
+            rec_list = [(rec, dur) for i, (rec, dur) in enumerate(chunk_indices) if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)]  # List of (sub-) recordings, each as (rec, dur)
 
             # TODO: Seed festlegen, damit reproduzierbar geshufflet wird
             if self.subset == "train":
@@ -502,16 +524,11 @@ class DiarizationLazy:
             #     max(0,int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift))  ##  - 2
             #     for rec, dur in rec_list
             # ])
-            dataset_length = sum(
-                [
-                    int(
-                        (dur[1] - dur[0] - self.chunk_size + self.chunk_shift)
-                        / self.chunk_shift
-                    )
-                    for rec, dur in rec_list
-                    if dur[1] - dur[0] >= self.chunk_size
-                ]
-            )
+            dataset_length = sum([
+                int((dur[1] - dur[0] - self.chunk_size + self.chunk_shift) / self.chunk_shift)
+                for rec, dur in rec_list
+                if dur[1] - dur[0] >= self.chunk_size
+            ])
 
             # # # ------------------------------------
             # # OLD TEMP JUST TO COMPARE LENGTHS
@@ -523,9 +540,7 @@ class DiarizationLazy:
 
             lengths = [None] * self.world
             if self.world > 1:
-                torch.distributed.all_gather_object(
-                    lengths, dataset_length
-                )  # len(rec_list) ) #
+                torch.distributed.all_gather_object(lengths, dataset_length)  # len(rec_list) ) #
             else:
                 lengths = [dataset_length]
             # print(lengths, flush=True)
@@ -537,11 +552,15 @@ class DiarizationLazy:
 
             rec_list = self.extend_by_recording(rec_list, delta)
 
-            if self.subset == "train" and self.shuffle:
-                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
+            #  commented out cause with shuffle repetitions mixed in front and other exmaples cut of in the end
+            # if self.subset == "train" and self.shuffle:
+            #     filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
+            # else:
+            filtered_lazy = from_list(rec_list)
+            if self.debug_data:
+                filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk_debug)
             else:
-                filtered_lazy = from_list(rec_list)
-            filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
+                filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
             filtered_lazy = filtered_lazy.unbatch()
             # shuffling
             # if self.subset == "train":
@@ -574,7 +593,6 @@ class DiarizationLazy:
             #     worker_chunks[min_worker] += num_chunks
             #
             # rec_list = worker_recs[worker_id]
-
             filtered_lazy = rec_list.filter(
                 lambda x: x["counter"] % total_num_workers == worker_id
             )
@@ -602,9 +620,10 @@ class DiarizationLazy:
         if not self.only_waveform:
             filtered_lazy = filtered_lazy.map(self.get_spatial_features)
         lazy = filtered_lazy.map(self.to_dict)
-        if self.subset == "train" and not self.debug:
+
+        if self.subset == "train":
             lazy = lazy.shuffle(buffer_size=self.buffer_size, reshuffle=True)
-        # print('Final length:', self.max_len , flush=True)
+
         if self.rotate:
             lazy = lazy.map(self.rotate_channels)
         self.lazy = IterableWrapper(
@@ -772,7 +791,8 @@ class DiarizationLazy:
 
             self._length += len(examples)
 
-        # else:
+        else:
+            self.discarded += 1
         #     # TODO: neccessary or not?
         #     examples = [{"rec": rec, "audio_path": path, "start": start, "end": start+self.chunk_size,
         #                  "data": data[:, int(start*self.sample_rate):int((start+self.chunk_size)*self.sample_rate)]}]
@@ -785,6 +805,38 @@ class DiarizationLazy:
         #     examples = [random.choice(examples)]
 
         # return examples
+        if self.subset == "train" and self.shuffle:
+            random.shuffle(examples)
+        return examples
+
+    def extract_wavforms_and_chunk_debug(self, example):
+        """Debug version: skip all I/O and validation, just chunk metadata."""
+        rec, (start, end) = example
+        # In debug mode, we skip audio loading entirely
+        # Just verify paths exist once, then create chunk examples with None data
+
+        rec_len = end - start
+        if rec_len >= self.chunk_size:
+            examples = []
+            for st, ed in _gen_chunk_indices(
+                    0, rec_len, self.chunk_size, self.chunk_shift
+            ):
+                examples.append(
+                    {
+                        "counter": self.counter,
+                        "rec": rec,
+                        "audio_path": self.rec_scp[rec],
+                        "global_start": start,
+                        "start": start + st,
+                        "end": start + ed,
+                        "data": None,
+                    }
+                )
+                self.counter = self.counter + 1
+            self._length += len(examples)
+        else:
+            self.discarded += 1
+
         if self.subset == "train" and self.shuffle:
             random.shuffle(examples)
         return examples

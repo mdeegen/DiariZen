@@ -261,7 +261,7 @@ class DiarizationLazy:
             debug=False,
             num_workers=0,
             gradient_accumulation_steps=1,
-            only_wav=False,
+            only_waveform=False,
             batch_size=16,
             shuffle = True,
             beamformit = False,
@@ -275,7 +275,7 @@ class DiarizationLazy:
         self.sub_rec = sub_rec
         self.segment_size = segment_size
         self.segment_overlap = segment_overlap
-        self.only_wav = only_wav
+        self.only_waveform = only_waveform
         self.beamformit = beamformit
 
         self.sample_rate = sample_rate
@@ -381,17 +381,16 @@ class DiarizationLazy:
             #     self.max_len = math.ceil(self.max_len / N) * N
 
             num = sum(lengths)
-            delta = self.max_len  - dataset_length
+            delta = self.max_len - dataset_length
             # print(self.rank, "Max length:", self.max_len , "number of chunks:", num, flush=True)
 
             rec_list = self.extend_by_recording(rec_list, delta)
 
-
-            if self.subset == "train" and self.shuffle:
-                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
-                print("shuffled", flush=True)
-            else:
-                filtered_lazy = from_list(rec_list)
+            #  commented out cause shuffle of workers made half the data go missing (filtering later on breaks down)
+            # if self.subset == "train" and self.shuffle:
+            #     filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
+            # else:
+            filtered_lazy = from_list(rec_list)
             filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
             filtered_lazy = filtered_lazy.unbatch()
 
@@ -460,7 +459,7 @@ class DiarizationLazy:
                 chunk_indices = self.reco2dur.items()
 
 
-            rec_list = [(rec,  dur) for i, (rec, dur) in enumerate(chunk_indices) if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)]   # List of (sub-) recordings, each as (rec, dur)
+            rec_list = [(rec, dur) for i, (rec, dur) in enumerate(chunk_indices) if (i % self.world == self.rank and dur[1] - dur[0] >= self.chunk_size)]   # List of (sub-) recordings, each as (rec, dur)
 
             # TODO: Seed festlegen, damit reproduzierbar geshufflet wird
             if self.subset == "train":
@@ -499,10 +498,10 @@ class DiarizationLazy:
 
             rec_list = self.extend_by_recording(rec_list, delta)
 
-            if self.subset == "train" and self.shuffle:
-                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
-            else:
-                filtered_lazy = from_list(rec_list)
+            # if self.subset == "train" and self.shuffle:
+            #     filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
+            # else:
+            filtered_lazy = from_list(rec_list)
             filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
             filtered_lazy = filtered_lazy.unbatch()
             # shuffling
@@ -517,7 +516,7 @@ class DiarizationLazy:
             #     print(f"Rank {self.rank} BERECHNETE LÄNGE", self._length, self._length/self.batch_size, flush=True)
             #     print(f"{self.rank}_COUTNER: ", self.counter, self.counter / self.batch_size, flush=True)
 
-        else: # total_num_workers > 1:
+        else:  # total_num_workers > 1:
             # # Berechne Chunks pro Recording vorher
             # rec_with_chunks = []
             # for rec, dur in rec_list:
@@ -562,12 +561,12 @@ class DiarizationLazy:
         # filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
         # filtered_lazy = filtered_lazy.unbatch()
         # filtered_lazy = filtered_lazy.map(self.get_chunk_labels)
-        # if not self.only_wav:
+        # if not self.only_waveform:
         #     filtered_lazy = filtered_lazy.map(self.get_spatial_features)
         # lazy = filtered_lazy.map(self.to_dict)
 
         filtered_lazy = filtered_lazy.map(self.get_chunk_labels)
-        if not self.only_wav:
+        if not self.only_waveform:
             filtered_lazy = filtered_lazy.map(self.get_spatial_features)
         lazy = filtered_lazy.map(self.to_dict)
 
@@ -929,7 +928,7 @@ class DiarizationLazy:
 
     def to_dict(self, ex):
         # print(f"DDP Worker: {self.rank}", ex["rec"], flush=True)
-        if self.only_wav:
+        if self.only_waveform:
             return {
                 "data": ex["data"],
                 "mask_label": ex["mask_label"],

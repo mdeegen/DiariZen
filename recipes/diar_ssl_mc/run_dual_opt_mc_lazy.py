@@ -4,10 +4,10 @@
 
 import argparse
 from pathlib import Path
-import itertools
+# import itertools
 import toml
 
-import numpy as np
+# import numpy as np
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from diarizen.logger import init_logging_logger
 from diarizen.utils import instantiate
 from diarizen.ckpt_utils import average_ckpt
-from torch.utils.data import Dataset, IterableDataset
+# from torch.utils.data import Dataset, IterableDataset
 
 from dataset_lazy import _collate_fn, IterableWrapper
 from dataset import _collate_fn as _collate_fn_non_lazy
@@ -39,7 +39,8 @@ def run(config, resume):
         # use_distributed_sampler=False,
     )
 
-    set_seed(config["meta"]["seed"], device_specific=True)
+    # TODO: ACHTUNG! DEVICE SPECIFIC TRUE
+    set_seed(config["meta"]["seed"]) # , device_specific=True)
 
     model = instantiate(config["model"]["path"], args=config["model"]["args"])
     model_num_frames, model_rf_duration, model_rf_step = model.get_rf_info
@@ -87,7 +88,7 @@ def run(config, resume):
     else:
         optimizer_small = instantiate(
             config["optimizer_small"]["path"],
-            args={"params": model.wavlm_model.parameters()}
+            args={"params": model.wavlm_model.parameters()}  #  wavlm or wavlm_model?
             | config["optimizer_small"]["args"]
             | {"lr": config["optimizer_small"]["args"]["lr"]},
         )
@@ -100,6 +101,8 @@ def run(config, resume):
     
     (model, optimizer_small, optimizer_big) = accelerator.prepare(model, optimizer_small, optimizer_big)
 
+    spk_count_loss = config["trainer"]["args"].get("spk_count_loss", False)
+    only_waveform = config["trainer"]["args"].get("only_waveform", False)
     # pass model receptive field info to dataset
     train_dataset_config = config["train_dataset"]["args"]
     train_dataset_config["model_num_frames"] = model_num_frames
@@ -118,7 +121,7 @@ def run(config, resume):
         # noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
         # noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
         gcpsd=config["meta"].get("gcpsd", False),
-        only_waveform=config["train_dataset"]["args"].get("only_wav", False),
+        only_waveform=only_waveform,
         bf=config["train_dataset"]["args"].get("beamformit", False),
     )
     _collate_fn_non_lazy_partial = partial(
@@ -127,7 +130,7 @@ def run(config, resume):
         # noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
         # noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
         gcpsd=config["meta"].get("gcpsd", False),
-        only_waveform=config["train_dataset"]["args"].get("only_wav", False)
+        only_waveform=only_waveform
     )
 
     # accelerator.state.use_distributed_sampler = False

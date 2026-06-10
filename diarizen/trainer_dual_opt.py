@@ -6,7 +6,7 @@ import math
 import sys
 import time
 from pathlib import Path
-
+import pickle
 from sklearn.metrics import confusion_matrix, f1_score, recall_score, precision_score
 
 import pandas as pd
@@ -45,10 +45,12 @@ class Trainer:
         optimizer_big,
         aux_loss=False,
         spk_count_loss=False,
+        debug_data=False,
     ):
         """Create an instance of BaseTrainer for training, validation, and fine-tuning."""
         self.config = config
         self.resume = resume
+        self.debug_data = debug_data
 
         # GPU
         self.accelerator = accelerator
@@ -798,10 +800,34 @@ class Trainer:
             print(
                 "LISTE:", len(self.id_list), "SET:", len(set(self.id_list)), flush=True
             )
+            total = len(self.id_list)
+            unique = len(set(self.id_list))
 
-            # duplicates = [id for id in self.id_list if self.id_list.count(id) > 1]
-            # unique_duplicates = sorted(duplicates)
-            # print("DUPLICATES:", unique_duplicates, "COUNT:", len(unique_duplicates), flush=True)
+            if self.debug_data:
+                rank = self.accelerator.process_index
+                stats_path = Path(self.exp_dir) / f"id_list_stats{rank}.txt"
+                duplicates_path = Path(self.exp_dir) / f"id_list_duplicates{rank}.txt"
+                id_list_path = Path(self.exp_dir) / f"id_list{rank}.pkl"
+                duplicates_list_path = Path(self.exp_dir) / f"dublicates_list{rank}.pkl"
+                stats_path.parent.mkdir(parents=True, exist_ok=True)
+                with stats_path.open("w", encoding="utf-8") as fh:
+                    fh.write(f"LISTE len(self.id_list): {total}\n")
+                    fh.write(f"SET len(set(self.id_list)): {unique}\n")
+                logger.info(f"Saved id list stats to {stats_path.as_posix()}")
+
+                duplicates = [id for id in self.id_list if self.id_list.count(id) > 1]
+                unique_duplicates = sorted(duplicates)
+                print("DUPLICATES:", unique_duplicates, "COUNT:", len(unique_duplicates), flush=True)
+                with duplicates_path.open("w", encoding="utf-8") as fh:
+                    fh.write(f"unique_duplicates: {unique_duplicates}\n")
+                    fh.write(f"COUNT:, len(unique_duplicates): {len(unique_duplicates)}\n")
+
+                with id_list_path.open("wb") as fh:
+                    pickle.dump(self.id_list, fh)
+                logger.info(f"Saved id list to {id_list_path.as_posix()}")
+                with duplicates_list_path.open("wb") as fh:
+                    pickle.dump(self.duplicates, fh)
+                logger.info(f"Saved id list to {duplicates_list_path.as_posix()}")
 
             self.state.epochs_trained += 1
             self.accuracy = (

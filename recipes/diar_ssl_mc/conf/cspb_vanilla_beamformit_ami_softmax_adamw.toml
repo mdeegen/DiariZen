@@ -37,8 +37,8 @@ path = "torch.optim.AdamW"
 lr = 2e-5
 
 [optimizer_big]
-#path = "torch.optim.AdamW"
-path = "torch.optim.Adam"
+path = "torch.optim.AdamW"
+#path = "torch.optim.Adam"
 [optimizer_big.args]
 #lr = 1e-3
 lr = 1e-4
@@ -51,7 +51,7 @@ path = "diarizen.models.eend.cspb_vanilla_ref.Model"
 model_path = "/scratch/hpc-prf-nt2/deegen/models/wavlm_base_plus"
 softmax = true
 projection= false
-layer_norm= true
+layer_norm= false
 downstream_model = "blstm"
 wavlm_layer_num = 13
 wavlm_feat_dim = 768

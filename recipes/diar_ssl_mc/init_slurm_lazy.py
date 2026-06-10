@@ -4,13 +4,13 @@ from pathlib import Path
 
 
 BATCHFILE_TEMPLATE_EVAL = """#!/bin/bash
-#SBATCH -t 50:00:00          # time limit hrs:min:sec
+#SBATCH -t 20:00:00          # time limit hrs:min:sec
 #SBATCH -A hpc-prf-nt2
 #SBATCH -p gpu
 #SBATCH --output {nickname}_eval_%j.out
 #SBATCH --error {nickname}_eval_%j.err
 #SBATCH -J {nickname}_eval
-#SBATCH --gres=gpu:a100:4            # 4 GPU
+#SBATCH --gres=gpu:a100:1            # 4 GPU
 #SBATCH --mem=450G               # entspricht mem_free
 #SBATCH --ntasks=1          # slurm und accelerate get into conflict => slurm =1
 
@@ -18,7 +18,7 @@ BATCHFILE_TEMPLATE_EVAL = """#!/bin/bash
 
 
 cd /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc
-srun bash run_stage_noctua2_lazy.sh diarizen_shared_wavlm_counting_pruned_att
+srun bash run_stage_cspb_no_avg.sh cspb_vanilla_beamformit_ami_softmax_
 """
 
 def init(_run, experiment_dir=None):
