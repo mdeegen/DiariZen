@@ -49,7 +49,7 @@ Fb=0.8
 infer_affix=_oracle_clustering
 
 avg_ckpt_num=5
-val_metric=F1score   # Loss or DER
+val_metric=Loss   # Loss or DER or F1score for classification
 val_mode=best   # [prev, best, center]  
 
 # scoring setup
@@ -63,16 +63,16 @@ echo $CUDA_VISIBLE_DEVICES
 if [ $stage -le 1 ]; then
     if (! $use_dual_opt); then
         echo "stage1: use single-opt for model training..."
-        source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1" accelerate launch \
+        source  /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1" accelerate launch \
             --num_processes 2 --main_process_port 1134 \
             run_single_opt.py -C $train_conf -M validate
     else
         echo "stage1: use dual-opt for model training..."
-        source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1,2,3" accelerate launch \
+        source  /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1,2,3" accelerate launch \
             --num_processes 4 --main_process_port 1137 \
             run_dual_opt_mc_lazy.py -C $train_conf -M train
 #############            ### Debugguing: use only one GPU and worker
-##        source /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0" accelerate launch \
+##        source /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0" accelerate launch \
 #            --num_processes 1 --main_process_port 1134 \
 #            run_dual_opt_mc.py -C $train_conf -M train
     fi
@@ -100,7 +100,7 @@ if [ $stage -le 2 ]; then
     for dset in  NOTSOFAR1 AliMeeting AMI AISHELL4 ; do
         echo "Inference on $dset..."
         # conda activate diarizen && python infer_avg_mc.py -C $config_dir \ ### CHiME7
-        source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && python infer_avg_oracle.py -C $config_dir \
+        source  /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && python infer_avg_oracle.py -C $config_dir \
             -i ${data_dir}/${dtype}/${dset}/wav.scp \
             -o ${diarization_dir}/infer$infer_affix/metric_${val_metric}_${val_mode}/avg_ckpt${avg_ckpt_num}/${dtype}/${dset} \
             --rttm_file ${data_dir}/${dtype}/${dset}/rttm \
@@ -129,14 +129,14 @@ if [ $stage -le 2 ]; then
         fi
 
         for collar in 0 0.25; do
-            source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && python ${dscore_dir}/score.py \
+            source  /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && python ${dscore_dir}/score.py \
                 -r ${REF_DIR}/${dtype}/${dset}/rttm \
                 -s $OUT_DIR/*.rttm --collar ${collar} \
                 > $OUT_DIR/result_collar${collar}
         done
         echo "stage4: overlap scoring..."
         for collar in 0 0.25; do
-        source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && python -m diarizen.scoring.der_ov \
+        source /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && python -m diarizen.scoring.der_ov \
                         --storage_dir $OUT_DIR \
                         --ref ${REF_DIR}/${dtype}/${dset}/rttm \
                         --collar ${collar}

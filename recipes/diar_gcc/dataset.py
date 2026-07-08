@@ -16,12 +16,12 @@ import soundfile as sf
 from typing import Dict
 
 from paderbox.io import dump_json, load_json
+
 from diarizen.spatial_features.gcc_phat import compute_vad_th, get_gcc_for_all_channel_pairs_torch
 from diarizen.spatial_features.segmentation import spatial_segmentation
 from torch.utils.data import Dataset
 from diarizen.spatial_features.gcc_phat import (get_gcc_for_all_channel_pairs, channel_wise_activities,
                                                 convert_to_frame_wise_activities, get_dominant_time_frequency_mask)
-
 
 def get_dtype(value: int) -> str:
     """Return the most suitable type for storing the

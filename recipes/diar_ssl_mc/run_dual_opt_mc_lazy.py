@@ -77,21 +77,21 @@ def run(config, resume):
     # # )
     freeze_wavlm = config["finetune"].get("freeze_wavlm", False)
 
-    if freeze_wavlm:
-        dummy_param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-        optimizer_small = instantiate(
-            config["optimizer_small"]["path"],
-            args={"params": [dummy_param]}
-                 | config["optimizer_small"]["args"]
-                 | {"lr": config["optimizer_small"]["args"]["lr"]},
-        )
-    else:
-        optimizer_small = instantiate(
-            config["optimizer_small"]["path"],
-            args={"params": model.wavlm_model.parameters()}  #  wavlm or wavlm_model?
-            | config["optimizer_small"]["args"]
-            | {"lr": config["optimizer_small"]["args"]["lr"]},
-        )
+    # if freeze_wavlm:
+    dummy_param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+    optimizer_small = instantiate(
+        config["optimizer_small"]["path"],
+        args={"params": [dummy_param]}
+             | config["optimizer_small"]["args"]
+             | {"lr": config["optimizer_small"]["args"]["lr"]},
+    )
+    # else:
+    #     optimizer_small = instantiate(
+    #         config["optimizer_small"]["path"],
+    #         args={"params": model.wavlm_model.parameters()}  #  wavlm or wavlm_model?
+    #         | config["optimizer_small"]["args"]
+    #         | {"lr": config["optimizer_small"]["args"]["lr"]},
+    #     )
     optimizer_big = instantiate(
         config["optimizer_big"]["path"],
         args={"params": model.non_wavlm_parameters()}
@@ -124,14 +124,15 @@ def run(config, resume):
         only_waveform=only_waveform,
         bf=config["train_dataset"]["args"].get("beamformit", False),
     )
-    _collate_fn_non_lazy_partial = partial(
-        _collate_fn_non_lazy,
-        max_speakers_per_chunk=config["model"]["args"]["max_speakers_per_chunk"],
-        # noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
-        # noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
-        gcpsd=config["meta"].get("gcpsd", False),
-        only_waveform=only_waveform
-    )
+    # print("HI", flush=True)
+    # _collate_fn_non_lazy_partial = partial(
+    #     _collate_fn_non_lazy,
+    #     max_speakers_per_chunk=config["model"]["args"]["max_speakers_per_chunk"],
+    #     # noisy_labels=config["trainer"]["args"].get("noisy_labels", False),
+    #     # noise_prob=config["trainer"]["args"].get("noise_prob", 0.2),
+    #     gcpsd=config["meta"].get("gcpsd", False),
+    #     only_waveform=only_waveform
+    # )
 
     # accelerator.state.use_distributed_sampler = False
     if "train" in args.mode:
@@ -183,12 +184,13 @@ def run(config, resume):
 
             # print("After prepare length:", len(train_dataset))
         else:
-            train_dataset = instantiate(config["train_dataset"]["path"], args=train_dataset_config)
-            train_dataloader = DataLoader(
-                dataset=train_dataset, collate_fn=_collate_fn_non_lazy_partial, shuffle=False,
-                **config["train_dataset"]["dataloader"]
-            )
-            train_dataloader = accelerator.prepare(train_dataloader)
+            assert False, config["train_dataset"]["path"]
+            # train_dataset = instantiate(config["train_dataset"]["path"], args=train_dataset_config)
+            # train_dataloader = DataLoader(
+            #     dataset=train_dataset, collate_fn=_collate_fn_non_lazy_partial, shuffle=False,
+            #     **config["train_dataset"]["dataloader"]
+            # )
+            # train_dataloader = accelerator.prepare(train_dataloader)
 
     if "train" in args.mode or "validate" in args.mode:
         # TODO: dev doch nicht lokal shufflen

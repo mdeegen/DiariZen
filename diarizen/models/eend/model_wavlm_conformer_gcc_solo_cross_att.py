@@ -24,7 +24,7 @@ from pyannote.audio.utils.receptive_field import (
 )
 
 
-from diarizen.models.module.conformer import ConformerEncoder, gcc_encoder, init_as_identity
+from diarizen.models.module.conformer import ConformerEncoder, gcc_encoder_cross_attention, init_as_identity
 from diarizen.models.module.wav2vec2.model import wav2vec2_model as wavlm_model
 from diarizen.models.module.wavlm_config import get_config
 from diarizen.spatial_features.gcc_phat import (get_gcc_for_all_channel_pairs, channel_wise_activities,
@@ -88,7 +88,7 @@ class Model(BaseModel):
             use_posi=use_posi,
             output_activate_function=output_activate_function
         )
-        self.gcc_encoder = gcc_encoder(
+        self.gcc_encoder = gcc_encoder_cross_attention(
             attention_in_aux=attention_in_aux,  # search range for delay
             linear_input_size=linear_input_size,  # number of frames per channel
             linear_output_size=linear_output_size,  # number of frames per channel
@@ -98,8 +98,6 @@ class Model(BaseModel):
             sin_cos = sin_cos,
             ffn = ffn,
             )
-
-        # Diarization head
         if bce_loss:
             self.classifier = nn.Linear(attention_in, max_speakers_per_chunk)
             self.activation = self.default_activation()

@@ -1,7 +1,4 @@
-import math
-
 import torch
-
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -43,30 +40,40 @@ class RelativePositionalEncoding(nn.Module):
 class cross_attn(nn.Module):
     """ Multi head self-attention layer
     """
-    def __init__(self, dim_main, dim_aux, num_heads=4, dropout=0.1):
+    def __init__(self,
+             dim_main,
+             dim_aux,
+             num_heads=4,
+             dropout=0.1):
         super().__init__()
         self.dim_main = dim_main
         self.dim_aux = dim_aux
 
-        if dim_main != dim_aux:
+        if dim_aux is not None and dim_main != dim_aux :
             self.proj_aux = nn.Linear(dim_aux, dim_main)
         else:
             self.proj_aux = nn.Identity()
 
+        self.norm_main = nn.LayerNorm(dim_main)
+        self.norm_aux = nn.LayerNorm(dim_aux)
         self.attn = nn.MultiheadAttention(embed_dim=dim_main, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(dim_main)
+
 
     def forward(self, main_feat, aux_feat, mask=None):
+        """ Fused cross-attention block.
+        main_feat: Tensor of shape ``(B, T, D_main)``. Query-Zweig. -> z.B. WavLM
+        aux_feat: Tensor of shape ``(B, T, D_aux)``. Key\-/Value-Zweig. -> z.B. GCC
+        mask: Optional boolean padding mask of shape ``(B, T)``. ``True``
+            marks gültige Padding-Positionen für ``aux_feat``.
+
+        Returns: Tensor of shape ``(B, T, D_main)``. Residual-Output des Main-Zweigs.
         """
-        main_feat: (B, T, D_main)  -> z.B. WavLM
-        aux_feat: (B, T, D_aux)    -> z.B. GCC
-        """
-        aux_proj = self.proj_aux(aux_feat)  # (B, T, D_main)
-        # MultiheadAttention expects: (B, T, D)
-        attn_output, _ = self.attn(query=main_feat, key=aux_proj, value=aux_proj, key_padding_mask=mask)
-        # Residual + LayerNorm
-        out = self.norm(main_feat + self.dropout(attn_output))
+        main_norm = self.norm_main(main_feat)
+        aux_norm = self.norm_aux(aux_feat)
+        aux_proj = self.proj_aux(aux_norm)
+        attn_output, _ = self.attn(query=main_norm, key=aux_proj, value=aux_proj, key_padding_mask=mask)
+        out = main_feat + self.dropout(attn_output)
         return out
 
 class MultiHeadSelfAttention(nn.Module):
@@ -831,8 +838,8 @@ class gcc_encoder_magnitude_attention(nn.Module):
         for encoder_layer, linear_layer, linear_layer2, norm, ffn_layer, magn_layer in zip(self.encoder_layer, self.linear_layer, self.linear_layer2,
                                                               self.norm_layers, self.ffn_layer, self.magnitude_layer):
 
-            magn = gcc_features[:, :, -1, :]
-            gcc_features_no_magn = rearrange(gcc_features[:, :, :-1], "b f c d -> (b c) f d")  # (batch*frames, channels, delay): batch*channels, frames, delay?
+            magn = gcc_features[:, :, -1, :] # (B, Frames, Delay)
+            gcc_features_no_magn = rearrange(gcc_features[:, :, :-1], "b f c d -> (b c) f d")  # (batch,frames, channels, delay): batch*channels, frames, delay?
             gcc_features_no_magn = encoder_layer(gcc_features_no_magn, pos_k)
             magn = magn_layer(magn, pos_k)
             gcc_features_no_magn = rearrange(gcc_features_no_magn, "(b c) f d -> b f c d", b=b, c=c-1)
@@ -923,6 +930,215 @@ class gcc_encoder_magnitude_attention(nn.Module):
         gcc_features = gcc_features.view(b, f, c, d)
         gcc_features = gcc_features.mean(dim=2) # # (batch, frames, delays)
         return gcc_features
+
+
+class gcc_encoder_cross_attention(nn.Module):
+    """ GCC Encoder for auxiliary channel processing.
+    This module processes GCC features with a series of ConformerMHA layers,
+    linear layers, and normalization layers to extract meaningful representations
+    for auxiliary channels, such as delays in GCC features.
+    """
+    def __init__(
+            self,
+            attention_in_aux: int = 200, # search range for delay
+            linear_input_size: int = 399, # number of frames per channel
+            linear_output_size: int = 399, # number of frames per channel
+            num_head_aux = 4,
+            num_layer_aux: int = 3,
+            dropout: float = 0.1,
+            ffn = None,
+            sin_cos = False,
+    ) -> None:
+        # in_size: int = 256, # anzahl frequenzen wenn ich für einen channel das mache oder?
+        # num_head: int = 4, # nur einer oder soll ich mehrere nehmen obwohl ich nur self att auf einem channel machen will?
+        # dropout: float = 0.1,
+        super().__init__()
+        self.sin_cos = sin_cos
+        self.encoder_layer = nn.ModuleList([
+            cross_attn( dim_main=attention_in_aux,
+                        dim_aux=attention_in_aux,
+                        num_heads=num_head_aux,
+                        dropout=dropout
+            ) for _ in range(num_layer_aux)
+        ])
+        self.magnitude_layer = nn.ModuleList([
+            ConformerMHA(in_size=attention_in_aux,
+                         num_head=num_head_aux,
+                         dropout=dropout
+                         ) for _ in range(num_layer_aux)
+        ])
+        self.linear_layer = nn.ModuleList([
+            nn.Linear(in_features=linear_input_size, out_features= linear_output_size
+            ) for _ in range(num_layer_aux)
+        ])
+        # GCC encoder braucht nicht identiy initialisiert werden sondern nur der part wo die emb ignoriert werden sollen
+        # vielleicht initialisieren, sodass anfangs keine channel infos ausgetauscht werden?
+        # for layer in self.linear_layer:
+        #     init_as_identity(layer)
+
+        self.norm_layers = nn.ModuleList([
+            nn.LayerNorm(2 * linear_input_size) for _ in range(num_layer_aux)
+        ])
+
+        self.linear_layer2 = nn.ModuleList([
+            nn.Linear(in_features=2*linear_input_size, out_features=linear_output_size
+                      ) for _ in range(num_layer_aux)
+        ])
+        self.encoder_end_layer = ConformerMHA(in_size=attention_in_aux,
+                                 num_head=num_head_aux,
+                                 dropout=dropout)
+
+        if ffn is not None:
+            self.ffn_layer = nn.ModuleList([
+                PositionwiseFeedForward(in_size=attention_in_aux, ffn_hidden=ffn, dropout=dropout) for _ in range(num_layer_aux)
+            ])
+        else:
+            self.ffn_layer = [None for _ in range(num_layer_aux)]
+
+    def sin_cos_representation(self, gcc_features):
+        " gets the sin and cos representations of the phase from the complex valued input"
+        magnitude = torch.real(gcc_features[:, :, -1, :])
+        gcc_features = gcc_features[:, :, :-1, :]  # remove magnitude
+        phase = torch.angle(gcc_features)
+        sin_phase = torch.sin(phase)
+        cos_phase = torch.cos(phase)
+        gcc_features = torch.concatenate((sin_phase, cos_phase, magnitude[:,:,None,:]), dim=2)  # (batch, frames, 2*channels, freq)
+        # pad_size = (0, 3)  # pad 3 zeros at the end to make divisible for att heads
+        # gcc_features = torch.nn.functional.pad(gcc_features, pad_size)
+        return gcc_features
+
+    def forward(self, gcc_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+             auxiliary shape: (16, 399, 28, 200) stft params fitted to wavlm frames, 28 channel combinations, 200 delays
+        """
+        b, f, c, d = gcc_features.shape  # (batch, frames, channels, delays)
+        pos_k = None
+
+        if self.sin_cos:
+            gcc_features = self.sin_cos_representation(gcc_features)
+            c = gcc_features.size(2)
+
+
+        # # gcc_features = gcc_features.permute(0, 2, 1, 3).reshape(b * c, f, d)
+
+        for encoder_layer, linear_layer, linear_layer2, norm, ffn_layer, magn_layer in zip(self.encoder_layer, self.linear_layer, self.linear_layer2,
+                                                              self.norm_layers, self.ffn_layer, self.magnitude_layer):
+
+            magn = gcc_features[:, :, -1, :]  # (B, F, D)
+
+            gcc_features_no_magn = rearrange(
+                gcc_features[:, :, :-1],
+                "b f c d -> (b c) f d",
+            )  # (B * (C - 1), F, D)
+
+            magn_for_cross_attn = (
+                magn[:, None, :, :]
+                .expand(-1, c - 1, -1, -1)
+            )
+            magn_for_cross_attn = rearrange(magn_for_cross_attn, "b c f d -> (b c) f d")
+            gcc_features_no_magn = encoder_layer(
+                gcc_features_no_magn,
+                magn_for_cross_attn,
+                pos_k,
+            )
+            magn = magn_layer(magn, pos_k)
+            gcc_features_no_magn = rearrange(
+                gcc_features_no_magn,
+                "(b c) f d -> b f c d",
+                b=b,
+                c=c - 1,
+            )
+            gcc_features = torch.cat(
+                (gcc_features_no_magn, magn.unsqueeze(2)),
+                dim=2,
+            )
+
+            if ffn_layer is not None:
+                gcc_features = ffn_layer(gcc_features)
+            gcc_features = rearrange(gcc_features, "b f c d -> b c d f", b=b, c=c)  # (batch,channels, delay, frames)
+
+            # TODO: instead of rearranging try use dim parameter and take first rearrange out of loop and change last one? and then one out of loop?
+            gcc_features_c = linear_layer(gcc_features)  # (batch,channels, delay, frames)
+            gcc_features_c = torch.mean(gcc_features_c, dim=1, keepdim=True)  # (batch, 1, delay, frames)
+            gcc_features_c = gcc_features_c.expand(-1, gcc_features.size(1), -1, -1)
+            gcc_features_temp = torch.cat((gcc_features, gcc_features_c), dim=-1)  # (batch, channels, delay, 2*frames)
+
+            gcc_features_temp = norm(gcc_features_temp)
+            gcc_features_temp = linear_layer2(gcc_features_temp)  # (batch, channels, delay, frames)
+
+            gcc_features = gcc_features + gcc_features_temp  # (batch, channels, delay, frames) + # (batch, channels, delay, frames)
+            gcc_features = rearrange(gcc_features, "b c d f -> b f c d")  # (batch, frames, channels, delays)
+
+            # # Optimized code:
+            # # gcc_features = rearrange(gcc_features, "b f c d -> (b c) f d")  # (batch*frames, channels, delay):
+            # gcc_features = encoder_layer(gcc_features, pos_k)
+            # if ffn_layer is not None:
+            #     gcc_features = ffn_layer(gcc_features)
+            #
+            # gcc_features = gcc_features.view(b, c, f, d)  # .permute(0, 1, 3, 2)  # (batch, channels, , delay)
+            # gcc_features_c = linear_layer(gcc_features)  # (batch,channels, delay, frames)
+            # gcc_features_c = torch.mean(gcc_features_c, dim=1, keepdim=True)  # (batch, 1, delay, frames)
+            # gcc_features_c = gcc_features_c.expand(-1, gcc_features.size(1), -1, -1)
+            # gcc_features_temp = torch.cat((gcc_features, gcc_features_c), dim=-1)  # (batch, channels, delay, 2*frames)
+            #
+            # gcc_features_temp = norm(gcc_features_temp)
+            # gcc_features_temp = linear_layer2(gcc_features_temp)      # (batch, channels, delay, frames)
+            #
+            # gcc_features = gcc_features + gcc_features_temp      # (batch, channels, delay, frames) + # (batch, channels, delay, frames)
+            # gcc_features = gcc_features.reshape(b * c, f, d)         # (B, T, C, D)  .permute(0, 1, 3, 2)
+            #
+            #
+            # # # Optimized code:
+            # # gcc_features = gcc_features.permute(0, 2, 1, 3).reshape(b * c, f, d)
+            # #
+            # # gcc_features = encoder_layer(gcc_features, pos_k)
+            # # gcc_features = gcc_features.view(b, c, d, f)
+            # #
+            # # gcc_features_c = linear_layer(gcc_features)  # (batch,channels, delay, frames)
+            # # gcc_features_c = torch.mean(gcc_features_c, dim=1, keepdim=True)  # (batch, 1, delay, frames)
+            # # gcc_features_c = gcc_features_c.repeat(1, gcc_features.size(1), 1, 1)
+            # # gcc_features_temp = torch.cat((gcc_features, gcc_features_c), dim=-1)  # (batch, channels, delay, 2*frames)
+            # #
+            # # gcc_features_temp = norm(gcc_features_temp)
+            # # gcc_features_temp = linear_layer2(gcc_features_temp)      # (batch, channels, delay, frames)
+            # #
+            # # gcc_features = gcc_features + gcc_features_temp      # (batch, channels, delay, frames) + # (batch, channels, delay, frames)
+            # # gcc_features = gcc_features.permute(0, 3, 1, 2)         # (B, T, C, D)
+            #
+            #
+
+
+
+            # # edited code:
+            # gcc_features = rearrange(gcc_features, "b f c d -> (b c) f d")  # (batch*frames, channels, delay):
+            #
+            # gcc_features = encoder_layer(gcc_features, pos_k)
+            # if ffn_layer is not None:
+            #     gcc_features = ffn_layer(gcc_features)
+            # gcc_features = rearrange(gcc_features, "(b c) f d -> b c f d", b=b, c=c)  # (batch,channels, delay, frames)
+            # # gcc_features = rearrange(gcc_features, "(b c) f d -> b c d f", b=b, c=c)  # (batch,channels, delay, frames)
+            #
+            # # TODO: instead of rearranging try use dim parameter and take first rearrange out of loop and change last one? and then one out of loop?
+            # gcc_features_c = linear_layer(gcc_features)  # (batch,channels, delay, frames)
+            # gcc_features_c = torch.mean(gcc_features_c, dim=1, keepdim=True)  # (batch, 1, delay, frames)
+            # gcc_features_c = gcc_features_c.expand(-1, gcc_features.size(1), -1, -1)
+            # gcc_features_temp = torch.cat((gcc_features, gcc_features_c), dim=-1)  # (batch, channels, delay, 2*frames)
+            #
+            # gcc_features_temp = norm(gcc_features_temp)
+            # gcc_features_temp = linear_layer2(gcc_features_temp)      # (batch, channels, delay, frames)
+            #
+            # gcc_features = gcc_features + gcc_features_temp      # (batch, channels, delay, frames) + # (batch, channels, delay, frames)
+            # gcc_features = rearrange(gcc_features, "b c f d -> b f c d")  # (batch, frames, channels, delays)
+            # # gcc_features = rearrange(gcc_features, "b c d f -> b f c d")  # (batch, frames, channels, delays)
+
+        gcc_features = gcc_features.permute(0, 2, 1, 3).reshape(b * c, f, d)
+        gcc_features = self.encoder_end_layer(gcc_features, pos_k)
+        gcc_features = gcc_features.view(b, f, c, d)
+        gcc_features = gcc_features.mean(dim=2) # # (batch, frames, delays)
+        return gcc_features
+
+
 
 class BLSTMEncoder(nn.Module):
     def __init__(
@@ -1827,21 +2043,21 @@ class BLSTM_FILM(nn.Module):
             hidden_size: int = 512,
             num_layers: int = 2,
             film_dim=1,
-            attention_in: int = 256,
+            # attention_in: int = 256,
     ) -> None:
         super().__init__()
 
         assert num_layers in [2, 3], "Currently only 2 or 3 layers supported for blstm"
         if num_layers == 2:
             self.blstm_layers = nn.ModuleList([
-                FiLM(attention_in, film_dim),
+                FiLM(input_size, film_dim), # att oder input size?
                 torch.nn.LSTM(input_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
                 FiLM(2*hidden_size, film_dim),
                 torch.nn.LSTM(2*hidden_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
             ])
         else:
             self.blstm_layers = nn.ModuleList([
-            FiLM(attention_in, film_dim),
+            FiLM(input_size, film_dim),
             torch.nn.LSTM(input_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
             FiLM(2*hidden_size, film_dim),
             torch.nn.LSTM(2*hidden_size, hidden_size, num_layers=1, bidirectional=True, batch_first=True),
@@ -1864,7 +2080,6 @@ class BLSTM_FILM(nn.Module):
                 x, _ = layer(x) # No dedicated hidden initialization
                 # print("blstm", x.shape) [16, 399, 1024]
         return x
-    
 
 
 class BLSTM(nn.Module):
@@ -1902,10 +2117,6 @@ class BLSTM(nn.Module):
                 x, _ = layer(x) # No dedicated hidden initialization
                 # print("blstm", x.shape) [16, 399, 1024]
         return x
-    
-
-
-
 
 
 class BLSTM_torch(nn.Module):

@@ -74,17 +74,16 @@ if [ $stage -le 1 ]; then
             run_single_opt.py -C $train_conf -M validate
     else
         echo "stage1: use dual-opt for model training..."
-#        source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1,2,3" accelerate launch \
-        source  /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1,2,3" accelerate launch \
+        source /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1,2,3" accelerate launch \
             --num_processes 4 --main_process_port 1137 \
-            run_dual_opt_mc_lazy.py -C $train_conf -M train $resume_flag
+            run_dual_opt_mc_lazy_seeds.py -C $train_conf -M train $resume_flag
 ##################            ### Debugguing: use only one GPU and worker
 #        source /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0" accelerate launch \
 #            --num_processes 1 --main_process_port 1134 \
 #            run_dual_opt_mc_lazy.py -C $train_conf -M train $resume_flag
     fi
 fi
-/pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate
+
 diarization_dir=$exp_root/$conf_name    # can be replaced by our pre-trained models, e.g. diarization_dir=/YOUR_PATH/checkpoints/wavlm_updated_conformer
 config_dir=`ls $diarization_dir/*.toml | sort -r | head -n 1`
 diarizen_hub=/mnt/matylda3/ihan/hugging-face/hub/models--BUT-FIT--diarizen-wavlm-large-md-s80/snapshots/50167e9a5243663ff51777823ff7d53da7b87166

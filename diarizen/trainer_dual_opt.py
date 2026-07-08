@@ -87,6 +87,7 @@ class Trainer:
         self.aux_loss = self.trainer_config.get("aux_loss", False)
         self.debug = self.trainer_config.get("debug", False)
         self.compute_second_der = self.trainer_config.get("compute_second_der", True)
+        self.multi_head = self.trainer_config.get("multi_head", False)
 
         self.max_steps = self.trainer_config.get("max_steps", 0)
         self.max_epochs = self.trainer_config.get("max_epochs", sys.maxsize)
@@ -188,15 +189,16 @@ class Trainer:
         logger.info(f"Environment information:\n{print_env()}")
 
         # Model summary
+        # print total parameter and trianable parameters, requieres grad false and true
         logger.info(f"\n {summary(self.model, verbose=0)}")
 
     def track_files(self):
         out_dir = self.source_code_backup_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         save_dirs = [
-            "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/diarizen",
-            "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/recipes/diar_gcc",
-            "/mnt/matylda5/qdeegen/deploy/forschung/DiariZen/recipes/diar_ssl_mc",
+            "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/diarizen",
+            "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_gcc",
+            "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/diar_ssl_mc",
         ]
         patterns = ["*.py", "*.toml", "*.sh"]
         for folder in save_dirs:

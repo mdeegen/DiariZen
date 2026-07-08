@@ -282,6 +282,9 @@ class DiarizationLazy:
         batch_size=16,
         shuffle=True,
         debug_data = False,
+        second_shuffle = False,
+        test_shuffle = False,
+        seed_shuffle = False,
     ):
         self.chunk_indices = []
         self.subset = subset
@@ -298,6 +301,9 @@ class DiarizationLazy:
         self.chunk_sample_size = sample_rate * chunk_size
         self.chunk_size = chunk_size
         self.chunk_shift = chunk_shift
+        self.second_shuffle = second_shuffle
+        self.test_shuffle = test_shuffle
+        self.seed_shuffle = seed_shuffle
 
         self.channel_mode = channel_mode
 
@@ -402,13 +408,29 @@ class DiarizationLazy:
             delta = self.max_len - dataset_length
             # print(self.rank, "Max length:", self.max_len , "number of chunks:", num, flush=True)
 
-            rec_list = self.extend_by_recording(rec_list, delta)
-
-            #  commented out cause shuffle of workers made half the data go missing (filtering later on breaks down)
             # if self.subset == "train" and self.shuffle:
-            #     filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
-            # else:
-            filtered_lazy = from_list(rec_list)
+            #     random.shuffle(rec_list)
+
+            # rec_list = self.extend_by_recording(rec_list, delta)
+            # filtered_lazy = from_list(rec_list)
+
+            rec_list = self.extend_by_recording(rec_list, delta)
+            if self.subset == "train" and self.second_shuffle:
+                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True, rng=np.random.default_rng(12))
+                print("shuffled", flush=True)
+            elif self.subset == "train" and self.test_shuffle:
+                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True) # rng=np.random.default_rng(2007))
+                print("TEST shuffled", flush=True)
+            elif self.subset == "train" and self.seed_shuffle:
+                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True, rng=np.random.default_rng(9947))
+                print("Seed shuffled", flush=True)
+            else:
+                filtered_lazy = from_list(rec_list)
+
+            # TODO: Test and debug if this really reuces data, otherwise keep it!!
+            #  # TODO or shuffle before extesnion"!! oder warum ging das nicht?
+            #  commented out cause shuffle of workers made half the data go missing (filtering later on breaks down)
+
             # filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk)
             # filtered_lazy = filtered_lazy.unbatch()
             if self.debug_data:
@@ -479,7 +501,15 @@ class DiarizationLazy:
             return
         else:
             self.lazy = self.init_ds()
+            # TODO: single worker mcht als init die init_ds und damit jede epoche gleicher datensatz?
+            # TODO: Ist das sinnvoll doer jede epoche neu shufflen, augmentieren etc
+            # TODO: Seed anfangs speichern ud für deses ziehen nutzen?
+            # TODO rotieren: IDEE: jede epoche anderes batch rotieren und anders rotieren, und orig nicht entfernen sondern beide behalten?
+            # TODO: Jedes batch 4-5 rotieren aber nicht jede epoche immer die selben.
+
+        # TODO: Ein shuffle oder so mit anderem seed einführen sodass random augmentiert wird?
             return
+
 
     def init_ds(self, worker_id=0, total_num_workers=0, rec_list=None):
         if not total_num_workers > 1:
@@ -552,11 +582,21 @@ class DiarizationLazy:
 
             rec_list = self.extend_by_recording(rec_list, delta)
 
-            #  commented out cause with shuffle repetitions mixed in front and other exmaples cut of in the end
-            # if self.subset == "train" and self.shuffle:
-            #     filtered_lazy = from_list(rec_list).shuffle(reshuffle=True)
-            # else:
-            filtered_lazy = from_list(rec_list)
+            if self.subset == "train" and self.second_shuffle:
+                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True, rng=np.random.default_rng(12))
+            elif self.subset == "train" and self.test_shuffle:
+                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True) # rng=np.random.default_rng(2007))
+            elif self.subset == "train" and self.seed_shuffle:
+                filtered_lazy = from_list(rec_list).shuffle(reshuffle=True, rng=np.random.default_rng(3407)) # rng=np.random.default_rng(2007))
+                print("Seed shuffled", flush=True)
+            else:
+                filtered_lazy = from_list(rec_list)
+
+            # # if self.subset == "train" and self.shuffle:
+            # #     random.shuffle(rec_list)
+            # rec_list = self.extend_by_recording(rec_list, delta)
+            # filtered_lazy = from_list(rec_list)
+
             if self.debug_data:
                 filtered_lazy = filtered_lazy.map(self.extract_wavforms_and_chunk_debug)
             else:
@@ -658,6 +698,7 @@ class DiarizationLazy:
         return self.max_len
 
     def rotate_channels(self, example):
+        # TODO: gepsiecherten random seed zum rotieren nutzen und augmentation damit verbessern
         if self.rotate:
             rotation = random.randint(0, self.num_channels - 1)
             ch_idx = (np.arange(example["data"].shape[0]) + rotation) % example[

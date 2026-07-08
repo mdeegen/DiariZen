@@ -223,6 +223,11 @@ class Trainer(BaseTrainer):
         # auto GN
         self.grad_history = []
 
+        self.ctc_loss_fn = nn.CTCLoss(
+            blank=0,
+            zero_infinity=True
+        )
+
     def guarded_ce_loss(self, logits, targets, ignore_index=None):
         """
         logits: (N, C, ...) raw scores
@@ -422,7 +427,60 @@ class Trainer(BaseTrainer):
         else:
             y_pred = self.model(xs, gccs)
 
-        if not self.spk_count_loss:
+        if self.multi_head: # TODO checken alle und ausbauen
+            diar_logits = y_pred["diar_logits"]
+            asr_logits = y_pred["asr_logits"]
+            se_logits = y_pred["se_logits"]
+            B, T, d_diar = diar_logits.shape
+
+            if self.task == "diar":
+                diari_estimate = F.log_softmax(diar_logits, dim=-1)
+                multilabel = self.unwrap_model.powerset.to_multilabel(diari_estimate)
+                permutated_target, _ = permutate(multilabel, target)
+                permutated_target_powerset = self.unwrap_model.powerset.to_powerset(
+                    permutated_target.float()
+                )
+                loss_diar = nll_loss(
+                    diari_estimate,
+                    torch.argmax(permutated_target_powerset, dim=-1)
+                )
+
+            if self.task == "asr":
+                asr_targets = batch["transcript"] # No Batch dim!! => (B*words), length  list with each length [len(exmaple1), len(example2),...]
+                target_lengths = batch["target_lengths"]
+                log_probs = F.log_softmax(
+                    asr_logits,
+                    dim=-1
+                )
+                input_lengths = torch.full(
+                    (B,),
+                    asr_logits.shape[1],
+                    device=asr_logits.device,
+                    dtype=torch.long
+                )
+                loss_asr = self.ctc_loss_fn(
+                    log_probs.transpose(0, 1),
+                    asr_targets,
+                    input_lengths,
+                    target_lengths,
+                )
+
+            # if self.task == "se":
+            #     pred_mask = torch.sigmoid(se_logits)
+            #
+            #     loss_se = F.l1_loss(
+            #         pred_mask,
+            #         target_mask
+            #     )
+            # loss_diar = F.cross_entropy(diar_logits.reshape(-1, diar_out_dim), targets.reshape(-1))
+
+            # asr_logits = self.asr_head(h)                 # [B,T,V]
+            # asr_log_probs = F.log_softmax(asr_logits, dim=-1)
+            # loss_asr = ctc_loss(asr_log_probs, ...)
+
+            #loss_se = F.binary_cross_entropy_with_logits(se_logits, mask_target)
+
+        elif not self.spk_count_loss:
             if self.bce_loss:
                 # print(y_pred.shape, target.shape)
                 # print("3spk aktiv count:", (torch.sum(y_pred, dim=-1) == 3).sum().item())

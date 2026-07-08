@@ -63,7 +63,7 @@ REF_DIR=$data_dir
 dscore_dir=/scratch/hpc-prf-nt2/deegen/merlin/dscore/dscore
 
 echo $CUDA_VISIBLE_DEVICES
-
+source /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate
 # =======================================
 # =======================================
 if [ $stage -le 1 ]; then
@@ -78,7 +78,8 @@ if [ $stage -le 1 ]; then
 #            --num_processes 4 --main_process_port 1137 \
 #            run_dual_opt_cspb.py -C $train_conf -M train $resume_flag
 #################            ### Debugguing: use only one GPU and worker
-        source /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0" accelerate launch \
+#        source /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0" accelerate launch \
+        source /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0" accelerate launch \
             --num_processes 1 --main_process_port 1134 \
             run_dual_opt_cspb.py -C $train_conf -M train $resume_flag
     fi

@@ -25,6 +25,7 @@ from pyannote.audio.utils.receptive_field import (
 
 
 from diarizen.models.module.conformer import ConformerEncoder, gcc_encoder, init_as_identity
+from diarizen.models.module.heads import diarization_head
 from diarizen.models.module.wav2vec2.model import wav2vec2_model as wavlm_model
 from diarizen.models.module.wavlm_config import get_config
 from diarizen.spatial_features.gcc_phat import (get_gcc_for_all_channel_pairs, channel_wise_activities,
@@ -98,14 +99,48 @@ class Model(BaseModel):
             sin_cos = sin_cos,
             ffn = ffn,
             )
+        # -----------------------------------------------------------------------------------
+        # optional: one embedding adapter per task
+        self.task_adapters = nn.ModuleDict({
+            "diar": nn.Sequential(
+                nn.LayerNorm(attention_in),
+                nn.Dropout(dropout),
+                nn.Linear(attention_in, attention_in),
+                nn.ReLU(),
+            ),
+            "asr": nn.Sequential(
+                nn.LayerNorm(attention_in),
+                nn.Dropout(dropout),
+                nn.Linear(attention_in, attention_in),
+                nn.ReLU(),
+            ),
+            "se": nn.Sequential(
+                nn.LayerNorm(attention_in),
+                nn.Dropout(dropout),
+                nn.Linear(attention_in, attention_in),
+                nn.ReLU(),
+            ),
+        })
 
-        # Diarization head
-        if bce_loss:
-            self.classifier = nn.Linear(attention_in, max_speakers_per_chunk)
-            self.activation = self.default_activation()
-        else:
-            self.classifier = nn.Linear(attention_in, self.dimension)
-            self.activation = self.default_activation()
+        self.diarization_head = nn.Sequential(
+            nn.Linear(attention_in, attention_in),
+            nn.ReLU(),
+            nn.Linear(attention_in, self.dimension)) # diarization_head(emb_dim=attention_in, out_dim=self.dimension)
+
+        self.asr_head = nn.Sequential(
+            nn.Linear(attention_in, attention_in),
+            nn.ReLU(),
+            nn.Linear(attention_in, vocab_size)
+        )
+
+        self.se_head = nn.Sequential(
+            nn.Linear(attention_in, attention_in),
+            nn.ReLU(),
+            nn.Linear(attention_in, n_freq_bins)
+        )
+
+        # + mask = torch.sigmoid(mask_logits) und F1 IRM mask loss?
+        # TODO: es fehlt: forward für alles, im trainer task auflösen und outputs und loss und gewichtung der losse
 
     def non_wavlm_parameters(self):
         return [
@@ -113,7 +148,10 @@ class Model(BaseModel):
             *self.lnorm.parameters(),
             *self.conformer.parameters(),
             *self.gcc_encoder.parameters(),
-            *self.classifier.parameters(),
+            *self.task_adapters.parameters(),
+            *self.diarization_head.parameters(),
+            *self.asr_head.parameters(),
+            *self.se_head.parameters(),
         ]
 
     @property
@@ -221,7 +259,7 @@ class Model(BaseModel):
         step=receptive_field_step / self.sample_rate
         return num_frames, duration, step
 
-    def forward(self, waveforms: torch.Tensor, gcc_features=None) -> torch.Tensor:
+    def forward(self, waveforms: torch.Tensor, gcc_features=None, task=None) -> torch.Tensor:
         """Pass forward
 
         Parameters
@@ -239,12 +277,20 @@ class Model(BaseModel):
         outputs = self.proj(gcc_embeddings)
         outputs = self.lnorm(outputs)
 
-        outputs = self.conformer(outputs)
+        emb = self.conformer(outputs)
 
-        outputs = self.classifier(outputs)
-        outputs = self.activation(outputs)
+        diar_logits = self.diarization_head(emb)
 
-        return outputs
+        asr_logits = self.asr_head(emb)
+
+        se_logits = self.se_head(emb)
+
+        return {
+            "embedding": emb,
+            "diar_logits": diar_logits,
+            "asr_logits": asr_logits,
+            "se_logits": se_logits,
+        }
 
 if __name__ == '__main__':
     wavlm_conf_name = 'wavlm_base_md_s80'

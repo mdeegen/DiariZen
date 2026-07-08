@@ -50,6 +50,6 @@ dscore_dir=/scratch/hpc-prf-nt2/deegen/merlin/dscore/dscore
 echo $CUDA_VISIBLE_DEVICES
 
 echo "stage1: use dual-opt for model training..."
-source  /scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/.diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1,2,3" accelerate launch \
+source  /pc2/groups/hpc-prf-nt1/deegen/venvs/diarizen/bin/activate && CUDA_VISIBLE_DEVICES="0,1,2,3" accelerate launch \
     --num_processes 4 --main_process_port 1137 \
     eval_ckpts.py -C $train_conf -M train -R

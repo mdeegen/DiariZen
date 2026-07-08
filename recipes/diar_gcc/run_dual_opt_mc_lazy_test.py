@@ -10,20 +10,65 @@ import pickle
 # import numpy as np
 import toml
 # import torch
+
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from dataset import _collate_fn as _collate_fn_non_lazy
+
 from dataset_lazy import IterableWrapper, _collate_fn
 # from sklearn.utils.class_weight import compute_class_weight
+
 from torch.utils.data import DataLoader
 
 # from diarizen.ckpt_utils import average_ckpt
 from diarizen.logger import init_logging_logger
+# from diarizen.models.unix_enc.hubconf import unix_enc_base
 from diarizen.utils import instantiate
 
 
 def run(config, resume):
 
+
+    import torch
+    from diarizen.models.unix_enc.unix_enc_model import UnixEncModel, UnixEncConfig, UnixEncPretrainingConfig
+    # load_unixenc = "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/unixenc/fairseq_models/cfg1/checkpoints/checkpoint_last.converted.pt"
+    # ckpt = torch.load(load_unixenc, map_location="cpu")
+    # if isinstance(ckpt, dict):
+    #     print(ckpt.keys())
+    # unix_encoder
+    load_unixenc = "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/unixenc/fairseq_models/cfg1/checkpoints/checkpoint_last.converted.pt"
+    ckpt = torch.load(load_unixenc)
+    # model = unix_enc_base()
+    model_cfg = ckpt["model_cfg"]
+    # model_cfg["conv_feature_layers"] = "[(512,10,5)] + [(512,3,2)] * 4 + [(512,2,2)] * 2"
+
+    # model_cfg = UnixEncConfig(**model_cfg)
+    from dataclasses import fields
+    valid_keys = {f.name for f in fields(UnixEncConfig)}
+    model_cfg = {
+        k: v
+        for k, v in ckpt["model_cfg"].items()
+        if k in valid_keys
+    }
+    model_cfg = UnixEncConfig(**model_cfg)
+
+    valid_keys = {f.name for f in fields(UnixEncPretrainingConfig)}
+    task_cfg = {
+        k: v
+        for k, v in ckpt["task_cfg"].items()
+        if k in valid_keys
+    }
+    task_cfg = UnixEncPretrainingConfig(**task_cfg)
+    unixenc = UnixEncModel(
+        cfg=model_cfg,
+        task_cfg=task_cfg,
+        dictionaries=ckpt["dictionaries_symbols"]
+    )
+
+    # "[(512,10,5)] + [(512,3,2)] * 4 + [(512,2,2)] * 2"
+    unixenc.load_state_dict(ckpt["model_weight"], strict=True)
+    model = unixenc
+    # assert False
     # exp_dir = "/scratch/hpc-prf-nt2/deegen/deploy/forschung/DiariZen/recipes/diar_gcc/exp/test"
     # combined_id_list = []
     # total_read_length = 0
@@ -67,7 +112,7 @@ def run(config, resume):
         kwargs_handlers=[ddp_kwargs],
     )
     # TODO: ACHTUNG! DEVICE SPECIFIC TRUE
-    set_seed(config["meta"]["seed"]) # , device_specific=True)
+    set_seed(config["meta"]["seed"])#, device_specific=True)
 
     # model = instantiate(config["model"]["path"], args=config["model"]["args"])
     model_num_frames, model_rf_duration, model_rf_step =  (399, 0.025, 0.02) # model.get_rf_info
